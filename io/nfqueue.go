@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -215,6 +216,8 @@ type nfqueuePacketIO struct {
 	offloadCh        chan offloadEntry
 	offloadCtx       context.Context
 	offloadCancel    context.CancelFunc
+
+	startPostCommand string
 }
 
 type NFQueuePacketIOConfig struct {
@@ -230,6 +233,7 @@ type NFQueuePacketIOConfig struct {
 	Offload          bool
 	OffloadTTL       time.Duration
 	OffloadThreshold int
+	StartPostCommand string
 }
 
 func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
@@ -311,6 +315,7 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		go io.offloadWorker()
 		go io.offloadCleanup()
 	}
+	io.startPostCommand = config.StartPostCommand
 	return io, nil
 }
 
@@ -348,6 +353,12 @@ func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error
 			return err
 		}
 		n.rSet = true
+	}
+	if n.startPostCommand != "" {
+		cmd := exec.Command("sh", "-c", n.startPostCommand)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		_ = cmd.Run()
 	}
 	return nil
 }

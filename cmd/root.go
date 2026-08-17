@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -164,10 +163,9 @@ func initLogger() {
 }
 
 type cliConfig struct {
-	StartPostCommand string           `mapstructure:"startPostCommand"`
-	IO               cliConfigIO      `mapstructure:"io"`
-	Workers          cliConfigWorkers `mapstructure:"workers"`
-	Ruleset          cliConfigRuleset `mapstructure:"ruleset"`
+	IO      cliConfigIO      `mapstructure:"io"`
+	Workers cliConfigWorkers `mapstructure:"workers"`
+	Ruleset cliConfigRuleset `mapstructure:"ruleset"`
 }
 
 type cliConfigIO struct {
@@ -183,6 +181,7 @@ type cliConfigIO struct {
 	Offload          bool          `mapstructure:"offload"`
 	OffloadTTL       time.Duration `mapstructure:"offloadTtl"`
 	OffloadThreshold int           `mapstructure:"offloadThreshold"`
+	StartPostCommand string        `mapstructure:"startPostCommand"`
 }
 
 type cliConfigWorkers struct {
@@ -217,6 +216,7 @@ func (c *cliConfig) fillIO(config *engine.Config) error {
 		Offload:          c.IO.Offload,
 		OffloadTTL:       c.IO.OffloadTTL,
 		OffloadThreshold: c.IO.OffloadThreshold,
+		StartPostCommand: c.IO.StartPostCommand,
 	})
 	if err != nil {
 		return configError{Field: "io", Err: err}
@@ -325,27 +325,7 @@ func runMain(cmd *cobra.Command, args []string) {
 	}()
 
 	logger.Info("engine started")
-	go func() {
-		logger.Info("engine exited", zap.Error(en.Run(ctx)))
-	}()
-
-	// Post-start command
-	if config.StartPostCommand != "" {
-		logger.Info("executing post-start command", zap.String("cmd", config.StartPostCommand))
-		if err := execPostCommand(config.StartPostCommand); err != nil {
-			logger.Error("post-start command failed", zap.Error(err))
-		}
-	}
-
-	// Block main goroutine
-	<-ctx.Done()
-}
-
-func execPostCommand(command string) error {
-	cmd := exec.Command("sh", "-c", command)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	logger.Info("engine exited", zap.Error(en.Run(ctx)))
 }
 
 type engineLogger struct{}
