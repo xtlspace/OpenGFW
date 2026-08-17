@@ -45,3 +45,5 @@ OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wiki
 - IO 配置新增 `tcp` / `udp` / `ipv4` / `ipv6` 协议过滤选项（均未配置时默认全捕获；tcp 与 udp、ipv4 与 ipv6 不能同时为 false），nftables 规则按配置的地址族×协议组合生成
 - 修复 TCP 重组内存泄漏：定期 `FlushCloseOlderThan` 清理超时流
 - 修复 UDP 流内存泄漏：LRU 淘汰时释放对应 analyzer 资源
+- Go 版本升级至 1.26（`go.mod` 与 Release 构建同步）
+- 启用 PGO（Profile-Guided Optimization）：新增规则匹配基准测试 `BenchmarkMatch`，基于其 profile 生成 `default.pgo`，构建时自动生效
