@@ -8,7 +8,9 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/florianl/go-nfqueue"
 	"github.com/mdlayher/netlink"
@@ -27,7 +29,68 @@ const (
 	nftTable  = "opengfw"
 )
 
-func generateNftRules(local, rst bool, protos nfProtocolConfig) (*nftTableSpec, error) {
+type offloadKey struct {
+	ip   [4]byte
+	port uint16
+}
+
+type offloadCounterEntry struct {
+	count    int
+	allow    bool
+	lastSeen time.Time
+}
+
+type offloadCounter struct {
+	mu     sync.Mutex
+	counts map[offloadKey]*offloadCounterEntry
+}
+
+func newOffloadCounter() *offloadCounter {
+	return &offloadCounter{
+		counts: make(map[offloadKey]*offloadCounterEntry),
+	}
+}
+
+func (c *offloadCounter) increment(key offloadKey, allow bool, threshold int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, exists := c.counts[key]
+	if !exists {
+		c.counts[key] = &offloadCounterEntry{
+			count:    1,
+			allow:    allow,
+			lastSeen: time.Now(),
+		}
+		return false
+	}
+	entry.count++
+	entry.allow = allow
+	entry.lastSeen = time.Now()
+	if entry.count >= threshold {
+		delete(c.counts, key)
+		return true
+	}
+	return false
+}
+
+func (c *offloadCounter) cleanup(maxAge time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for key, entry := range c.counts {
+		if now.Sub(entry.lastSeen) > maxAge {
+			delete(c.counts, key)
+		}
+	}
+}
+
+type offloadEntry struct {
+	ip    net.IP
+	port  uint16
+	allow bool
+}
+
+func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration) (*nftTableSpec, error) {
 	if local && rst {
 		return nil, errors.New("tcp rst is not supported in local mode")
 	}
@@ -38,6 +101,19 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig) (*nftTableSpec, 
 	table.Defines = append(table.Defines, fmt.Sprintf("define ACCEPT_CTMARK=%d", nfqueueConnMarkAccept))
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", nfqueueConnMarkDrop))
 	table.Defines = append(table.Defines, fmt.Sprintf("define QUEUE_NUM=%d", nfqueueNum))
+	if offloadEnabled {
+		ttl := fmt.Sprintf("%ds", int(offloadTTL.Seconds()))
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "offload_allow",
+			Type:    "ipv4_addr . inet_service",
+			Timeout: ttl,
+		})
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "offload_drop",
+			Type:    "ipv4_addr . inet_service",
+			Timeout: ttl,
+		})
+	}
 	if local {
 		table.Chains = []nftChainSpec{
 			{Chain: "INPUT", Header: "type filter hook input priority filter; policy accept;"},
@@ -50,8 +126,11 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig) (*nftTableSpec, 
 	}
 	for i := range table.Chains {
 		c := &table.Chains[i]
-		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
+		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK")
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
+		if offloadEnabled {
+			c.Rules = append(c.Rules, offloadLookupRules(protos, rst)...)
+		}
 		if rst {
 			c.Rules = append(c.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
 		}
@@ -59,6 +138,28 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig) (*nftTableSpec, 
 		c.Rules = append(c.Rules, protos.queueRules()...)
 	}
 	return table, nil
+}
+
+func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
+	var rules []string
+	if protos.TCP {
+		rules = append(rules, "ip daddr . tcp dport @offload_allow accept")
+		rules = append(rules, "ip saddr . tcp sport @offload_allow accept")
+		if rst {
+			rules = append(rules, "ip daddr . tcp dport @offload_drop counter reject with tcp reset")
+			rules = append(rules, "ip saddr . tcp sport @offload_drop counter reject with tcp reset")
+		} else {
+			rules = append(rules, "ip daddr . tcp dport @offload_drop counter drop")
+			rules = append(rules, "ip saddr . tcp sport @offload_drop counter drop")
+		}
+	}
+	if protos.UDP {
+		rules = append(rules, "ip daddr . udp dport @offload_allow accept")
+		rules = append(rules, "ip saddr . udp sport @offload_allow accept")
+		rules = append(rules, "ip daddr . udp dport @offload_drop counter drop")
+		rules = append(rules, "ip saddr . udp sport @offload_drop counter drop")
+	}
+	return rules
 }
 
 // nfProtocolConfig controls which packets are queued for inspection.
@@ -101,23 +202,34 @@ type nfqueuePacketIO struct {
 
 	local bool
 	rst   bool
-	rSet  bool // whether the nftables rules have been set
+	rSet  bool
 
 	protos nfProtocolConfig
 
 	protectedDialer *net.Dialer
+
+	offloadEnabled   bool
+	offloadTTL       time.Duration
+	offloadThreshold int
+	offloadCounter   *offloadCounter
+	offloadCh        chan offloadEntry
+	offloadCtx       context.Context
+	offloadCancel    context.CancelFunc
 }
 
 type NFQueuePacketIOConfig struct {
-	QueueSize   uint32
-	ReadBuffer  int
-	WriteBuffer int
-	Local       bool
-	RST         bool
-	TCP         bool
-	UDP         bool
-	IPv4        bool
-	IPv6        bool
+	QueueSize        uint32
+	ReadBuffer       int
+	WriteBuffer      int
+	Local            bool
+	RST              bool
+	TCP              bool
+	UDP              bool
+	IPv4             bool
+	IPv6             bool
+	Offload          bool
+	OffloadTTL       time.Duration
+	OffloadThreshold int
 }
 
 func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
@@ -158,7 +270,15 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 			return nil, err
 		}
 	}
-	return &nfqueuePacketIO{
+	if config.Offload {
+		if config.OffloadTTL == 0 {
+			config.OffloadTTL = 60 * time.Second
+		}
+		if config.OffloadThreshold <= 0 {
+			config.OffloadThreshold = 3
+		}
+	}
+	io := &nfqueuePacketIO{
 		n:     n,
 		local: config.Local,
 		rst:   config.RST,
@@ -180,7 +300,18 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 				return err
 			},
 		},
-	}, nil
+	}
+	if config.Offload {
+		io.offloadEnabled = true
+		io.offloadTTL = config.OffloadTTL
+		io.offloadThreshold = config.OffloadThreshold
+		io.offloadCounter = newOffloadCounter()
+		io.offloadCtx, io.offloadCancel = context.WithCancel(context.Background())
+		io.offloadCh = make(chan offloadEntry, 1024)
+		go io.offloadWorker()
+		go io.offloadCleanup()
+	}
+	return io, nil
 }
 
 func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error {
@@ -251,10 +382,16 @@ func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte) erro
 	case VerdictAcceptModify:
 		return n.n.SetVerdictModPacket(nP.id, nfqueue.NfAccept, newPacket)
 	case VerdictAcceptStream:
+		if n.offloadEnabled {
+			n.checkOffload(nP.data, true)
+		}
 		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfAccept, nfqueueConnMarkAccept)
 	case VerdictDrop:
 		return n.n.SetVerdict(nP.id, nfqueue.NfDrop)
 	case VerdictDropStream:
+		if n.offloadEnabled {
+			n.checkOffload(nP.data, false)
+		}
 		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfDrop, nfqueueConnMarkDrop)
 	default:
 		// Invalid verdict, ignore for now
@@ -267,6 +404,9 @@ func (n *nfqueuePacketIO) ProtectedDialContext(ctx context.Context, network, add
 }
 
 func (n *nfqueuePacketIO) Close() error {
+	if n.offloadEnabled {
+		n.offloadCancel()
+	}
 	if n.rSet {
 		_ = n.setupNft(n.local, n.rst, true, n.protos)
 		n.rSet = false
@@ -275,7 +415,7 @@ func (n *nfqueuePacketIO) Close() error {
 }
 
 func (n *nfqueuePacketIO) setupNft(local, rst, remove bool, protos nfProtocolConfig) error {
-	rules, err := generateNftRules(local, rst, protos)
+	rules, err := generateNftRules(local, rst, protos, n.offloadEnabled, n.offloadTTL)
 	if err != nil {
 		return err
 	}
@@ -328,9 +468,24 @@ func nftDelete(family, table string) error {
 	return cmd.Run()
 }
 
+type nftSetSpec struct {
+	Name    string
+	Type    string
+	Timeout string
+}
+
+func (s nftSetSpec) String() string {
+	return fmt.Sprintf(`  set %s {
+    type %s
+    flags timeout
+    timeout %s
+  }`, s.Name, s.Type, s.Timeout)
+}
+
 type nftTableSpec struct {
 	Defines       []string
 	Family, Table string
+	Sets          []nftSetSpec
 	Chains        []nftChainSpec
 }
 
@@ -339,14 +494,18 @@ func (t *nftTableSpec) String() string {
 	for _, c := range t.Chains {
 		chains = append(chains, c.String())
 	}
+	sets := make([]string, 0, len(t.Sets))
+	for _, s := range t.Sets {
+		sets = append(sets, s.String())
+	}
 
 	return fmt.Sprintf(`
 %s
 
 table %s %s {
 %s
-}
-`, strings.Join(t.Defines, "\n"), t.Family, t.Table, strings.Join(chains, ""))
+%s
+}`, strings.Join(t.Defines, "\n"), t.Family, t.Table, strings.Join(sets, "\n"), strings.Join(chains, ""))
 }
 
 type nftChainSpec struct {
@@ -375,4 +534,84 @@ func ctIDFromCtBytes(ct []byte) uint32 {
 		}
 	}
 	return 0
+}
+
+func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool) {
+	if len(data) < 20 {
+		return
+	}
+	version := data[0] >> 4
+	if version != 4 {
+		return
+	}
+	ipHdrLen := int(data[0]&0xF) * 4
+	if len(data) < ipHdrLen+4 {
+		return
+	}
+	proto := data[9]
+	if proto != 6 && proto != 17 {
+		return
+	}
+	var ip [4]byte
+	copy(ip[:], data[16:20])
+	port := binary.BigEndian.Uint16(data[ipHdrLen+2 : ipHdrLen+4])
+
+	key := offloadKey{ip: ip, port: port}
+	if n.offloadCounter.increment(key, allow, n.offloadThreshold) {
+		select {
+		case n.offloadCh <- offloadEntry{ip: net.IP(ip[:]), port: port, allow: allow}:
+		default:
+		}
+	}
+}
+
+func (n *nfqueuePacketIO) offloadWorker() {
+	var batch []offloadEntry
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		var sb strings.Builder
+		for _, e := range batch {
+			set := "offload_allow"
+			if !e.allow {
+				set = "offload_drop"
+			}
+			fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
+				set, e.ip.String(), e.port, n.offloadTTL)
+		}
+		_ = nftAdd(sb.String())
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case entry := <-n.offloadCh:
+			batch = append(batch, entry)
+			if len(batch) >= 100 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-n.offloadCtx.Done():
+			flush()
+			return
+		}
+	}
+}
+
+func (n *nfqueuePacketIO) offloadCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			n.offloadCounter.cleanup(10 * time.Minute)
+		case <-n.offloadCtx.Done():
+			return
+		}
+	}
 }

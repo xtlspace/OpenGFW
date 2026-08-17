@@ -47,3 +47,5 @@ OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wiki
 - 修复 UDP 流内存泄漏：LRU 淘汰时释放对应 analyzer 资源
 - Go 版本升级至 1.26（`go.mod` 与 Release 构建同步）
 - 启用 PGO（Profile-Guided Optimization）：新增规则匹配基准测试 `BenchmarkMatch`，基于其 profile 生成 `default.pgo`，构建时自动生效
+- 新增 nftables 连接卸载（offload）功能：同一 dst+dport 达到指定次数后自动添加带 TTL 的 nftables 集合元素，后续连接内核直达不再进用户态分析；TTL 到期后重新采样
+  - 配置项：`offload`（开关）、`offloadTtl`（过期时间，默认 60s）、`offloadThreshold`（触发阈值，默认 3）
