@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -163,9 +164,10 @@ func initLogger() {
 }
 
 type cliConfig struct {
-	IO      cliConfigIO      `mapstructure:"io"`
-	Workers cliConfigWorkers `mapstructure:"workers"`
-	Ruleset cliConfigRuleset `mapstructure:"ruleset"`
+	StartPostCommand string           `mapstructure:"startPostCommand"`
+	IO               cliConfigIO      `mapstructure:"io"`
+	Workers          cliConfigWorkers `mapstructure:"workers"`
+	Ruleset          cliConfigRuleset `mapstructure:"ruleset"`
 }
 
 type cliConfigIO struct {
@@ -289,10 +291,9 @@ func runMain(cmd *cobra.Command, args []string) {
 
 	// Signal handling
 	ctx, cancelFunc := context.WithCancel(context.Background())
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		// Graceful shutdown
-		shutdownChan := make(chan os.Signal, 1)
-		signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 		<-shutdownChan
 		logger.Info("shutting down gracefully...")
 		cancelFunc()
@@ -324,7 +325,27 @@ func runMain(cmd *cobra.Command, args []string) {
 	}()
 
 	logger.Info("engine started")
-	logger.Info("engine exited", zap.Error(en.Run(ctx)))
+	go func() {
+		logger.Info("engine exited", zap.Error(en.Run(ctx)))
+	}()
+
+	// Post-start command
+	if config.StartPostCommand != "" {
+		logger.Info("executing post-start command", zap.String("cmd", config.StartPostCommand))
+		if err := execPostCommand(config.StartPostCommand); err != nil {
+			logger.Error("post-start command failed", zap.Error(err))
+		}
+	}
+
+	// Block main goroutine
+	<-ctx.Done()
+}
+
+func execPostCommand(command string) error {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 type engineLogger struct{}
