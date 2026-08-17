@@ -6,40 +6,36 @@
 [1]: https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg
 [2]: LICENSE
 
-**[中文文档](README.zh.md)**
-**[日本語ドキュメント](README.ja.md)**
+OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wikipedia.org/wiki/%E9%98%B2%E7%81%AB%E9%95%BF%E5%9F%8E) 实现，并且在许多方面比真正的 GFW 更强大。为何让那些掌权者独享乐趣？是时候把权力归还给人民，人人有墙建了。立即安装可以部署在家用路由器上的网络主权 - 你也能是老大哥。
 
-OpenGFW is your very own DIY Great Firewall of China (https://en.wikipedia.org/wiki/Great_Firewall), available as a flexible, easy-to-use open source program on Linux. Why let the powers that be have all the fun? It's time to give power to the people and democratize censorship. Bring the thrill of cyber-sovereignty right into your home router and start filtering like a pro - you too can play Big Brother.
+**文档网站： https://gfw.dev/**
 
-**Documentation site: https://gfw.dev/**
-
-Telegram group: https://t.me/OpGFW
+Telegram 群组： https://t.me/OpGFW
 
 > [!CAUTION]
-> This project is still in very early stages of development. Use at your own risk. We are looking for contributors to help us improve and expand the project.
+> 本项目仍处于早期开发阶段。测试时自行承担风险。我们正在寻求贡献者一起完善本项目。
 
-## Features
+## 功能
 
-- Full IP/TCP reassembly, various protocol analyzers
-  - HTTP, TLS, QUIC, DNS, SSH, SOCKS4/5, WireGuard, OpenVPN, and many more to come
-  - "Fully encrypted traffic" detection for Shadowsocks, VMess,
-    etc. (https://gfw.report/publications/usenixsecurity23/en/)
-  - Trojan (proxy protocol) detection
-  - [WIP] Machine learning based traffic classification
-- Full IPv4 and IPv6 support
-- Flow-based multicore load balancing
-- Connection offloading
-- Powerful rule engine based on [expr](https://github.com/expr-lang/expr)
-- Hot-reloadable rules (send `SIGHUP` to reload)
-- Flexible analyzer & modifier framework
-- Extensible IO implementation (only NFQueue for now)
-- [WIP] Web UI
+- 完整的 IP/TCP 重组，各种协议解析器
+  - HTTP, TLS, QUIC, DNS, SSH, SOCKS4/5, WireGuard, OpenVPN, 更多协议正在开发中
+  - Shadowsocks, VMess 等 "全加密流量" 检测 (https://gfw.report/publications/usenixsecurity23/zh/)
+  - Trojan 协议检测
+  - [开发中] 基于机器学习的流量分类
+- 同等支持 IPv4 和 IPv6
+- 基于流的多核负载均衡
+- 连接 offloading
+- 基于 [expr](https://github.com/expr-lang/expr) 的强大规则引擎
+- 规则可以热重载 (发送 `SIGHUP` 信号)
+- 灵活的协议解析和修改框架
+- 可扩展的 IO 实现 (目前只有 NFQueue)
+- [开发中] Web UI
 
-## Use cases
+## 使用场景
 
-- Ad blocking
-- Parental control
-- Malware protection
-- Abuse prevention for VPN/proxy services
-- Traffic analysis (log only mode)
-- Help you fulfill your dictatorial ambitions
+- 广告拦截
+- 家长控制
+- 恶意软件防护
+- VPN/代理服务滥用防护
+- 流量分析 (纯日志模式)
+- 助你实现你的独裁野心
