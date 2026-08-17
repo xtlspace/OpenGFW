@@ -173,6 +173,10 @@ type cliConfigIO struct {
 	WriteBuffer int    `mapstructure:"sndBuf"`
 	Local       bool   `mapstructure:"local"`
 	RST         bool   `mapstructure:"rst"`
+	TCP         bool   `mapstructure:"tcp"`
+	UDP         bool   `mapstructure:"udp"`
+	IPv4        bool   `mapstructure:"ipv4"`
+	IPv6        bool   `mapstructure:"ipv6"`
 }
 
 type cliConfigWorkers struct {
@@ -200,6 +204,10 @@ func (c *cliConfig) fillIO(config *engine.Config) error {
 		WriteBuffer: c.IO.WriteBuffer,
 		Local:       c.IO.Local,
 		RST:         c.IO.RST,
+		TCP:         c.IO.TCP,
+		UDP:         c.IO.UDP,
+		IPv4:        c.IO.IPv4,
+		IPv6:        c.IO.IPv6,
 	})
 	if err != nil {
 		return configError{Field: "io", Err: err}

@@ -38,3 +38,10 @@ OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wiki
 - VPN/代理服务滥用防护
 - 流量分析 (纯日志模式)
 - 助你实现你的独裁野心
+
+## 变更记录
+
+- 移除 iptables 相关代码，仅保留 nftables
+- IO 配置新增 `tcp` / `udp` / `ipv4` / `ipv6` 协议过滤选项（均未配置时默认全捕获；tcp 与 udp、ipv4 与 ipv6 不能同时为 false），nftables 规则按配置的地址族×协议组合生成
+- 修复 TCP 重组内存泄漏：定期 `FlushCloseOlderThan` 清理超时流
+- 修复 UDP 流内存泄漏：LRU 淘汰时释放对应 analyzer 资源

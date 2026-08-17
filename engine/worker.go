@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"time"
 
 	"github.com/apernet/OpenGFW/io"
 	"github.com/apernet/OpenGFW/ruleset"
@@ -17,6 +18,13 @@ const (
 	defaultTCPMaxBufferedPagesTotal         = 4096
 	defaultTCPMaxBufferedPagesPerConnection = 64
 	defaultUDPMaxStreams                    = 4096
+
+	// tcpFlushInterval is how often the reassembler is flushed to close
+	// idle/abandoned streams.
+	tcpFlushInterval = 5 * time.Second
+	// tcpStreamTimeout is how long a stream can stay idle before the
+	// reassembler closes and releases it from the stream pool.
+	tcpStreamTimeout = 5 * time.Minute
 )
 
 type workerPacket struct {
@@ -111,10 +119,16 @@ func (w *worker) Feed(p *workerPacket) {
 func (w *worker) Run(ctx context.Context) {
 	w.logger.WorkerStart(w.id)
 	defer w.logger.WorkerStop(w.id)
+	flushTicker := time.NewTicker(tcpFlushInterval)
+	defer flushTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-flushTicker.C:
+			// Close streams that have been idle for too long, so abandoned
+			// connections don't accumulate in the reassembly stream pool.
+			w.tcpAssembler.FlushCloseOlderThan(time.Now().Add(-tcpStreamTimeout))
 		case wPkt := <-w.packetChan:
 			if wPkt == nil {
 				// Closed

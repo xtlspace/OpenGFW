@@ -114,7 +114,10 @@ func (v *udpStreamValue) Match(ipFlow, udpFlow gopacket.Flow) (ok, rev bool) {
 }
 
 func newUDPStreamManager(factory *udpStreamFactory, maxStreams int) (*udpStreamManager, error) {
-	ss, err := lru.New[uint32, *udpStreamValue](maxStreams)
+	ss, err := lru.NewWithEvict[uint32, *udpStreamValue](maxStreams, func(key uint32, value *udpStreamValue) {
+		// Release analyzer resources when a stream is evicted from the cache.
+		value.Stream.Close()
+	})
 	if err != nil {
 		return nil, err
 	}

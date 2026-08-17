@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/coreos/go-iptables/iptables"
 	"github.com/florianl/go-nfqueue"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
@@ -29,7 +27,7 @@ const (
 	nftTable  = "opengfw"
 )
 
-func generateNftRules(local, rst bool) (*nftTableSpec, error) {
+func generateNftRules(local, rst bool, protos nfProtocolConfig) (*nftTableSpec, error) {
 	if local && rst {
 		return nil, errors.New("tcp rst is not supported in local mode")
 	}
@@ -58,34 +56,40 @@ func generateNftRules(local, rst bool) (*nftTableSpec, error) {
 			c.Rules = append(c.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
 		}
 		c.Rules = append(c.Rules, "ct mark $DROP_CTMARK counter drop")
-		c.Rules = append(c.Rules, "counter queue num $QUEUE_NUM bypass")
+		c.Rules = append(c.Rules, protos.queueRules()...)
 	}
 	return table, nil
 }
 
-func generateIptRules(local, rst bool) ([]iptRule, error) {
-	if local && rst {
-		return nil, errors.New("tcp rst is not supported in local mode")
-	}
-	var chains []string
-	if local {
-		chains = []string{"INPUT", "OUTPUT"}
-	} else {
-		chains = []string{"FORWARD"}
-	}
-	rules := make([]iptRule, 0, 4*len(chains))
-	for _, chain := range chains {
-		// Bypass protected connections
-		rules = append(rules, iptRule{"filter", chain, []string{"-m", "mark", "--mark", strconv.Itoa(nfqueueConnMarkAccept), "-j", "CONNMARK", "--set-mark", strconv.Itoa(nfqueueConnMarkAccept)}})
-		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(nfqueueConnMarkAccept), "-j", "ACCEPT"}})
-		if rst {
-			rules = append(rules, iptRule{"filter", chain, []string{"-p", "tcp", "-m", "connmark", "--mark", strconv.Itoa(nfqueueConnMarkDrop), "-j", "REJECT", "--reject-with", "tcp-reset"}})
-		}
-		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(nfqueueConnMarkDrop), "-j", "DROP"}})
-		rules = append(rules, iptRule{"filter", chain, []string{"-j", "NFQUEUE", "--queue-num", strconv.Itoa(nfqueueNum), "--queue-bypass"}})
-	}
+// nfProtocolConfig controls which packets are queued for inspection.
+type nfProtocolConfig struct {
+	TCP  bool
+	UDP  bool
+	IPv4 bool
+	IPv6 bool
+}
 
-	return rules, nil
+// queueRules returns the nftables queue rules to capture the configured
+// protocols. Traffic that does not match is left untouched by the kernel.
+func (c nfProtocolConfig) queueRules() []string {
+	all := c.TCP && c.UDP && c.IPv4 && c.IPv6
+	if all {
+		return []string{"counter queue num $QUEUE_NUM bypass"}
+	}
+	var rules []string
+	if c.IPv4 && c.TCP {
+		rules = append(rules, "meta nfproto ipv4 meta l4proto tcp counter queue num $QUEUE_NUM bypass")
+	}
+	if c.IPv4 && c.UDP {
+		rules = append(rules, "meta nfproto ipv4 meta l4proto udp counter queue num $QUEUE_NUM bypass")
+	}
+	if c.IPv6 && c.TCP {
+		rules = append(rules, "meta nfproto ipv6 meta l4proto tcp counter queue num $QUEUE_NUM bypass")
+	}
+	if c.IPv6 && c.UDP {
+		rules = append(rules, "meta nfproto ipv6 meta l4proto udp counter queue num $QUEUE_NUM bypass")
+	}
+	return rules
 }
 
 var _ PacketIO = (*nfqueuePacketIO)(nil)
@@ -93,14 +97,13 @@ var _ PacketIO = (*nfqueuePacketIO)(nil)
 var errNotNFQueuePacket = errors.New("not an NFQueue packet")
 
 type nfqueuePacketIO struct {
-	n     *nfqueue.Nfqueue
+	n *nfqueue.Nfqueue
+
 	local bool
 	rst   bool
-	rSet  bool // whether the nftables/iptables rules have been set
+	rSet  bool // whether the nftables rules have been set
 
-	// iptables not nil = use iptables instead of nftables
-	ipt4 *iptables.IPTables
-	ipt6 *iptables.IPTables
+	protos nfProtocolConfig
 
 	protectedDialer *net.Dialer
 }
@@ -111,24 +114,25 @@ type NFQueuePacketIOConfig struct {
 	WriteBuffer int
 	Local       bool
 	RST         bool
+	TCP         bool
+	UDP         bool
+	IPv4        bool
+	IPv6        bool
 }
 
 func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 	if config.QueueSize == 0 {
 		config.QueueSize = nfqueueDefaultQueueSize
 	}
-	var ipt4, ipt6 *iptables.IPTables
-	var err error
-	if nftCheck() != nil {
-		// We prefer nftables, but if it's not available, fall back to iptables
-		ipt4, err = iptables.NewWithProtocol(iptables.ProtocolIPv4)
-		if err != nil {
-			return nil, err
-		}
-		ipt6, err = iptables.NewWithProtocol(iptables.ProtocolIPv6)
-		if err != nil {
-			return nil, err
-		}
+	// Protocol filter defaults: capture all if none of the options are set.
+	if !config.TCP && !config.UDP && !config.IPv4 && !config.IPv6 {
+		config.TCP, config.UDP, config.IPv4, config.IPv6 = true, true, true, true
+	}
+	if !config.TCP && !config.UDP {
+		return nil, errors.New("tcp and udp cannot both be disabled")
+	}
+	if !config.IPv4 && !config.IPv6 {
+		return nil, errors.New("ipv4 and ipv6 cannot both be disabled")
 	}
 	n, err := nfqueue.Open(&nfqueue.Config{
 		NfQueue:      nfqueueNum,
@@ -158,8 +162,12 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		n:     n,
 		local: config.Local,
 		rst:   config.RST,
-		ipt4:  ipt4,
-		ipt6:  ipt6,
+		protos: nfProtocolConfig{
+			TCP:  config.TCP,
+			UDP:  config.UDP,
+			IPv4: config.IPv4,
+			IPv6: config.IPv6,
+		},
 		protectedDialer: &net.Dialer{
 			Control: func(network, address string, c syscall.RawConn) error {
 				var err error
@@ -204,11 +212,7 @@ func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error
 		return err
 	}
 	if !n.rSet {
-		if n.ipt4 != nil {
-			err = n.setupIpt(n.local, n.rst, false)
-		} else {
-			err = n.setupNft(n.local, n.rst, false)
-		}
+		err = n.setupNft(n.local, n.rst, false, n.protos)
 		if err != nil {
 			return err
 		}
@@ -264,18 +268,14 @@ func (n *nfqueuePacketIO) ProtectedDialContext(ctx context.Context, network, add
 
 func (n *nfqueuePacketIO) Close() error {
 	if n.rSet {
-		if n.ipt4 != nil {
-			_ = n.setupIpt(n.local, n.rst, true)
-		} else {
-			_ = n.setupNft(n.local, n.rst, true)
-		}
+		_ = n.setupNft(n.local, n.rst, true, n.protos)
 		n.rSet = false
 	}
 	return n.n.Close()
 }
 
-func (n *nfqueuePacketIO) setupNft(local, rst, remove bool) error {
-	rules, err := generateNftRules(local, rst)
+func (n *nfqueuePacketIO) setupNft(local, rst, remove bool, protos nfProtocolConfig) error {
+	rules, err := generateNftRules(local, rst, protos)
 	if err != nil {
 		return err
 	}
@@ -286,22 +286,6 @@ func (n *nfqueuePacketIO) setupNft(local, rst, remove bool) error {
 		// Delete first to make sure no leftover rules
 		_ = nftDelete(nftFamily, nftTable)
 		err = nftAdd(rulesText)
-	}
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (n *nfqueuePacketIO) setupIpt(local, rst, remove bool) error {
-	rules, err := generateIptRules(local, rst)
-	if err != nil {
-		return err
-	}
-	if remove {
-		err = iptsBatchDeleteIfExists([]*iptables.IPTables{n.ipt4, n.ipt6}, rules)
-	} else {
-		err = iptsBatchAppendUnique([]*iptables.IPTables{n.ipt4, n.ipt6}, rules)
 	}
 	if err != nil {
 		return err
@@ -331,14 +315,6 @@ func okBoolToInt(ok bool) int {
 	} else {
 		return 1
 	}
-}
-
-func nftCheck() error {
-	_, err := exec.LookPath("nft")
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func nftAdd(input string) error {
@@ -386,35 +362,6 @@ func (c *nftChainSpec) String() string {
     %s
   }
 `, c.Chain, c.Header, strings.Join(c.Rules, "\n\x20\x20\x20\x20"))
-}
-
-type iptRule struct {
-	Table, Chain string
-	RuleSpec     []string
-}
-
-func iptsBatchAppendUnique(ipts []*iptables.IPTables, rules []iptRule) error {
-	for _, r := range rules {
-		for _, ipt := range ipts {
-			err := ipt.AppendUnique(r.Table, r.Chain, r.RuleSpec...)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func iptsBatchDeleteIfExists(ipts []*iptables.IPTables, rules []iptRule) error {
-	for _, r := range rules {
-		for _, ipt := range ipts {
-			err := ipt.DeleteIfExists(r.Table, r.Chain, r.RuleSpec...)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func ctIDFromCtBytes(ct []byte) uint32 {
