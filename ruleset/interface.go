@@ -83,6 +83,7 @@ func (i StreamInfo) DstString() string {
 type MatchResult struct {
 	Action      Action
 	ModInstance modifier.Instance
+	RuleName    string
 }
 
 type Ruleset interface {

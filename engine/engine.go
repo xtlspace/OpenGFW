@@ -98,7 +98,7 @@ func (e *engine) dispatch(p io.Packet) bool {
 		layerType = layers.LayerTypeIPv6
 	} else {
 		// Unsupported network layer
-		_ = e.io.SetVerdict(p, io.VerdictAcceptStream, nil)
+		_ = e.io.SetVerdict(p, io.VerdictAcceptStream, nil, "")
 		return true
 	}
 	// Load balance by stream ID
@@ -107,8 +107,8 @@ func (e *engine) dispatch(p io.Packet) bool {
 	e.workers[index].Feed(&workerPacket{
 		StreamID: p.StreamID(),
 		Packet:   packet,
-		SetVerdict: func(v io.Verdict, b []byte) error {
-			return e.io.SetVerdict(p, v, b)
+		SetVerdict: func(v io.Verdict, b []byte, ruleName string) error {
+			return e.io.SetVerdict(p, v, b, ruleName)
 		},
 	})
 	return true

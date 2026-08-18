@@ -86,9 +86,10 @@ func (c *offloadCounter) cleanup(maxAge time.Duration) {
 }
 
 type offloadEntry struct {
-	ip    net.IP
-	port  uint16
-	allow bool
+	ip       net.IP
+	port     uint16
+	allow    bool
+	ruleName string
 }
 
 func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration) (*nftTableSpec, error) {
@@ -382,7 +383,7 @@ func (n *nfqueuePacketIO) packetAttributeSanityCheck(a nfqueue.Attribute) (ok bo
 	return true, -1
 }
 
-func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte) error {
+func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte, ruleName string) error {
 	nP, ok := p.(*nfqueuePacket)
 	if !ok {
 		return &ErrInvalidPacket{Err: errNotNFQueuePacket}
@@ -394,14 +395,14 @@ func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte) erro
 		return n.n.SetVerdictModPacket(nP.id, nfqueue.NfAccept, newPacket)
 	case VerdictAcceptStream:
 		if n.offloadEnabled {
-			n.checkOffload(nP.data, true)
+			n.checkOffload(nP.data, true, ruleName)
 		}
 		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfAccept, nfqueueConnMarkAccept)
 	case VerdictDrop:
 		return n.n.SetVerdict(nP.id, nfqueue.NfDrop)
 	case VerdictDropStream:
 		if n.offloadEnabled {
-			n.checkOffload(nP.data, false)
+			n.checkOffload(nP.data, false, ruleName)
 		}
 		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfDrop, nfqueueConnMarkDrop)
 	default:
@@ -547,7 +548,7 @@ func ctIDFromCtBytes(ct []byte) uint32 {
 	return 0
 }
 
-func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool) {
+func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool, ruleName string) {
 	if len(data) < 20 {
 		return
 	}
@@ -570,7 +571,7 @@ func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool) {
 	key := offloadKey{ip: ip, port: port}
 	if n.offloadCounter.increment(key, allow, n.offloadThreshold) {
 		select {
-		case n.offloadCh <- offloadEntry{ip: net.IP(ip[:]), port: port, allow: allow}:
+		case n.offloadCh <- offloadEntry{ip: net.IP(ip[:]), port: port, allow: allow, ruleName: ruleName}:
 		default:
 		}
 	}
@@ -591,8 +592,13 @@ func (n *nfqueuePacketIO) offloadWorker() {
 			if !e.allow {
 				set = "offload_drop"
 			}
-			fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
-				set, e.ip.String(), e.port, n.offloadTTL)
+			if e.ruleName != "" {
+				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d comment %q timeout %s }\n",
+					set, e.ip.String(), e.port, e.ruleName, n.offloadTTL)
+			} else {
+				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
+					set, e.ip.String(), e.port, n.offloadTTL)
+			}
 		}
 		_ = nftAdd(sb.String())
 		batch = batch[:0]

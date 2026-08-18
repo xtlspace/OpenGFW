@@ -27,7 +27,8 @@ const (
 
 type tcpContext struct {
 	*gopacket.PacketMetadata
-	Verdict tcpVerdict
+	Verdict  tcpVerdict
+	RuleName string
 }
 
 func (ctx *tcpContext) GetCaptureInfo() gopacket.CaptureInfo {
@@ -103,6 +104,7 @@ type tcpStream struct {
 	activeEntries []*tcpStreamEntry
 	doneEntries   []*tcpStreamEntry
 	lastVerdict   tcpVerdict
+	lastRuleName  string
 }
 
 type tcpStreamEntry struct {
@@ -121,6 +123,7 @@ func (s *tcpStream) Accept(tcp *layers.TCP, ci gopacket.CaptureInfo, dir reassem
 	} else {
 		ctx := ac.(*tcpContext)
 		ctx.Verdict = s.lastVerdict
+		ctx.RuleName = s.lastRuleName
 		return false
 	}
 }
@@ -153,7 +156,9 @@ func (s *tcpStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.Ass
 		if action != ruleset.ActionMaybe && action != ruleset.ActionModify {
 			verdict := actionToTCPVerdict(action)
 			s.lastVerdict = verdict
+			s.lastRuleName = result.RuleName
 			ctx.Verdict = verdict
+			ctx.RuleName = result.RuleName
 			s.logger.TCPStreamAction(s.info, action, false)
 			// Verdict issued, no need to process any more packets
 			s.closeActiveEntries()

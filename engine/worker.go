@@ -30,7 +30,7 @@ const (
 type workerPacket struct {
 	StreamID   uint32
 	Packet     gopacket.Packet
-	SetVerdict func(io.Verdict, []byte) error
+	SetVerdict func(io.Verdict, []byte, string) error
 }
 
 type worker struct {
@@ -134,8 +134,8 @@ func (w *worker) Run(ctx context.Context) {
 				// Closed
 				return
 			}
-			v, b := w.handle(wPkt.StreamID, wPkt.Packet)
-			_ = wPkt.SetVerdict(v, b)
+			v, b, ruleName := w.handle(wPkt.StreamID, wPkt.Packet)
+			_ = wPkt.SetVerdict(v, b, ruleName)
 		}
 	}
 }
@@ -147,18 +147,19 @@ func (w *worker) UpdateRuleset(r ruleset.Ruleset) error {
 	return w.udpStreamFactory.UpdateRuleset(r)
 }
 
-func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte) {
+func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte, string) {
 	netLayer, trLayer := p.NetworkLayer(), p.TransportLayer()
 	if netLayer == nil || trLayer == nil {
 		// Invalid packet
-		return io.VerdictAccept, nil
+		return io.VerdictAccept, nil, ""
 	}
 	ipFlow := netLayer.NetworkFlow()
 	switch tr := trLayer.(type) {
 	case *layers.TCP:
-		return w.handleTCP(ipFlow, p.Metadata(), tr), nil
+		v, rn := w.handleTCP(ipFlow, p.Metadata(), tr)
+		return v, nil, rn
 	case *layers.UDP:
-		v, modPayload := w.handleUDP(streamID, ipFlow, tr)
+		v, modPayload, ruleName := w.handleUDP(streamID, ipFlow, tr)
 		if v == io.VerdictAcceptModify && modPayload != nil {
 			tr.Payload = modPayload
 			_ = tr.SetNetworkLayerForChecksum(netLayer)
@@ -170,30 +171,30 @@ func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte)
 				}, p)
 			if err != nil {
 				// Just accept without modification for now
-				return io.VerdictAccept, nil
+				return io.VerdictAccept, nil, ""
 			}
-			return v, w.modSerializeBuffer.Bytes()
+			return v, w.modSerializeBuffer.Bytes(), ruleName
 		}
-		return v, nil
+		return v, nil, ruleName
 	default:
 		// Unsupported protocol
-		return io.VerdictAccept, nil
+		return io.VerdictAccept, nil, ""
 	}
 }
 
-func (w *worker) handleTCP(ipFlow gopacket.Flow, pMeta *gopacket.PacketMetadata, tcp *layers.TCP) io.Verdict {
+func (w *worker) handleTCP(ipFlow gopacket.Flow, pMeta *gopacket.PacketMetadata, tcp *layers.TCP) (io.Verdict, string) {
 	ctx := &tcpContext{
 		PacketMetadata: pMeta,
 		Verdict:        tcpVerdictAccept,
 	}
 	w.tcpAssembler.AssembleWithContext(ipFlow, tcp, ctx)
-	return io.Verdict(ctx.Verdict)
+	return io.Verdict(ctx.Verdict), ctx.RuleName
 }
 
-func (w *worker) handleUDP(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP) (io.Verdict, []byte) {
+func (w *worker) handleUDP(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP) (io.Verdict, []byte, string) {
 	ctx := &udpContext{
 		Verdict: udpVerdictAccept,
 	}
 	w.udpStreamManager.MatchWithContext(streamID, ipFlow, udp, ctx)
-	return io.Verdict(ctx.Verdict), ctx.Packet
+	return io.Verdict(ctx.Verdict), ctx.Packet, ctx.RuleName
 }

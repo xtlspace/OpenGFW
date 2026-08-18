@@ -85,6 +85,7 @@ func (r *exprRuleset) Match(info StreamInfo) MatchResult {
 				return MatchResult{
 					Action:      *rule.Action,
 					ModInstance: rule.ModInstance,
+					RuleName:    rule.Name,
 				}
 			}
 		}

@@ -38,7 +38,7 @@ type PacketIO interface {
 	// and stop when the context is cancelled.
 	Register(context.Context, PacketCallback) error
 	// SetVerdict sets the verdict for a packet.
-	SetVerdict(Packet, Verdict, []byte) error
+	SetVerdict(Packet, Verdict, []byte, string) error
 	// ProtectedDialContext is like net.DialContext, but the connection is "protected"
 	// in the sense that the packets sent/received through the connection must bypass
 	// the packet IO and not be processed by the callback.

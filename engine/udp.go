@@ -31,8 +31,9 @@ const (
 var errInvalidModifier = errors.New("invalid modifier")
 
 type udpContext struct {
-	Verdict udpVerdict
-	Packet  []byte
+	Verdict  udpVerdict
+	Packet   []byte
+	RuleName string
 }
 
 type udpStreamFactory struct {
@@ -165,6 +166,7 @@ type udpStream struct {
 	activeEntries []*udpStreamEntry
 	doneEntries   []*udpStreamEntry
 	lastVerdict   udpVerdict
+	lastRuleName  string
 }
 
 type udpStreamEntry struct {
@@ -182,6 +184,7 @@ func (s *udpStream) Accept(udp *layers.UDP, rev bool, uc *udpContext) bool {
 		return true
 	} else {
 		uc.Verdict = s.lastVerdict
+		uc.RuleName = s.lastRuleName
 		return false
 	}
 }
@@ -226,7 +229,9 @@ func (s *udpStream) Feed(udp *layers.UDP, rev bool, uc *udpContext) {
 		if action != ruleset.ActionMaybe {
 			verdict, final := actionToUDPVerdict(action)
 			s.lastVerdict = verdict
+			s.lastRuleName = result.RuleName
 			uc.Verdict = verdict
+			uc.RuleName = result.RuleName
 			s.logger.UDPStreamAction(s.info, action, false)
 			if final {
 				s.closeActiveEntries()
