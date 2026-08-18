@@ -181,6 +181,7 @@ type cliConfigIO struct {
 	Offload          bool          `mapstructure:"offload"`
 	OffloadTTL       time.Duration `mapstructure:"offloadTtl"`
 	OffloadThreshold int           `mapstructure:"offloadThreshold"`
+	OffloadCIDR      string        `mapstructure:"offloadCidr"`
 	StartPostCommand string        `mapstructure:"startPostCommand"`
 }
 
@@ -216,6 +217,7 @@ func (c *cliConfig) fillIO(config *engine.Config) error {
 		Offload:          c.IO.Offload,
 		OffloadTTL:       c.IO.OffloadTTL,
 		OffloadThreshold: c.IO.OffloadThreshold,
+		OffloadCIDR:      c.IO.OffloadCIDR,
 		StartPostCommand: c.IO.StartPostCommand,
 	})
 	if err != nil {

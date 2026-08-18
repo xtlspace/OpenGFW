@@ -213,6 +213,7 @@ type nfqueuePacketIO struct {
 	offloadEnabled   bool
 	offloadTTL       time.Duration
 	offloadThreshold int
+	offloadCIDR      *net.IPNet
 	offloadCounter   *offloadCounter
 	offloadCh        chan offloadEntry
 	offloadCtx       context.Context
@@ -234,6 +235,7 @@ type NFQueuePacketIOConfig struct {
 	Offload          bool
 	OffloadTTL       time.Duration
 	OffloadThreshold int
+	OffloadCIDR      string
 	StartPostCommand string
 }
 
@@ -275,7 +277,16 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 			return nil, err
 		}
 	}
+	var offloadCIDR *net.IPNet
 	if config.Offload {
+		if config.OffloadCIDR == "" {
+			return nil, errors.New("offloadCidr is required when offload is enabled")
+		}
+		_, cidr, err := net.ParseCIDR(config.OffloadCIDR)
+		if err != nil {
+			return nil, fmt.Errorf("invalid offloadCidr: %w", err)
+		}
+		offloadCIDR = cidr
 		if config.OffloadTTL == 0 {
 			config.OffloadTTL = 60 * time.Second
 		}
@@ -310,6 +321,7 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		io.offloadEnabled = true
 		io.offloadTTL = config.OffloadTTL
 		io.offloadThreshold = config.OffloadThreshold
+		io.offloadCIDR = offloadCIDR
 		io.offloadCounter = newOffloadCounter()
 		io.offloadCtx, io.offloadCancel = context.WithCancel(context.Background())
 		io.offloadCh = make(chan offloadEntry, 1024)
@@ -564,14 +576,26 @@ func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool, ruleName string)
 	if proto != 6 && proto != 17 {
 		return
 	}
-	var ip [4]byte
-	copy(ip[:], data[16:20])
-	port := binary.BigEndian.Uint16(data[ipHdrLen+2 : ipHdrLen+4])
+	var srcIP, dstIP [4]byte
+	copy(srcIP[:], data[12:16])
+	copy(dstIP[:], data[16:20])
+	srcPort := binary.BigEndian.Uint16(data[ipHdrLen : ipHdrLen+2])
+	dstPort := binary.BigEndian.Uint16(data[ipHdrLen+2 : ipHdrLen+4])
 
-	key := offloadKey{ip: ip, port: port}
+	var key offloadKey
+	if n.offloadCIDR.Contains(net.IP(dstIP[:])) {
+		// dst ∈ CIDR (inbound) → record src+sport
+		key = offloadKey{ip: srcIP, port: srcPort}
+	} else if n.offloadCIDR.Contains(net.IP(srcIP[:])) {
+		// src ∈ CIDR (outbound) → record dst+dport
+		key = offloadKey{ip: dstIP, port: dstPort}
+	} else {
+		return
+	}
+
 	if n.offloadCounter.increment(key, allow, n.offloadThreshold) {
 		select {
-		case n.offloadCh <- offloadEntry{ip: net.IP(ip[:]), port: port, allow: allow, ruleName: ruleName}:
+		case n.offloadCh <- offloadEntry{ip: net.IP(key.ip[:]), port: key.port, allow: allow, ruleName: ruleName}:
 		default:
 		}
 	}
@@ -587,6 +611,7 @@ func (n *nfqueuePacketIO) offloadWorker() {
 			return
 		}
 		var sb strings.Builder
+		ttl := fmt.Sprintf("%ds", int(n.offloadTTL.Seconds()))
 		for _, e := range batch {
 			set := "offload_allow"
 			if !e.allow {
@@ -594,10 +619,10 @@ func (n *nfqueuePacketIO) offloadWorker() {
 			}
 			if e.ruleName != "" {
 				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d comment %q timeout %s }\n",
-					set, e.ip.String(), e.port, e.ruleName, n.offloadTTL)
+					set, e.ip.String(), e.port, e.ruleName, ttl)
 			} else {
 				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
-					set, e.ip.String(), e.port, n.offloadTTL)
+					set, e.ip.String(), e.port, ttl)
 			}
 		}
 		_ = nftAdd(sb.String())
