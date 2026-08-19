@@ -92,7 +92,50 @@ type offloadEntry struct {
 	ruleName string
 }
 
-func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration) (*nftTableSpec, error) {
+type convergenceEntry struct {
+	ports    map[uint16]struct{}
+	lastSeen time.Time
+	promoted bool
+}
+
+type convergenceMap struct {
+	mu      sync.Mutex
+	entries map[[4]byte]*convergenceEntry
+}
+
+func newConvergenceMap() *convergenceMap {
+	return &convergenceMap{
+		entries: make(map[[4]byte]*convergenceEntry),
+	}
+}
+
+func (m *convergenceMap) add(ip [4]byte, port uint16, allow bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, exists := m.entries[ip]
+	if !exists {
+		entry = &convergenceEntry{
+			ports:    make(map[uint16]struct{}),
+			lastSeen: time.Now(),
+		}
+		m.entries[ip] = entry
+	}
+	entry.ports[port] = struct{}{}
+	entry.lastSeen = time.Now()
+}
+
+func (m *convergenceMap) cleanup(maxAge time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for ip, entry := range m.entries {
+		if now.Sub(entry.lastSeen) > maxAge {
+			delete(m.entries, ip)
+		}
+	}
+}
+
+func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
 	if local && rst {
 		return nil, errors.New("tcp rst is not supported in local mode")
 	}
@@ -116,6 +159,19 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 			Timeout: ttl,
 		})
 	}
+	if convergenceEnabled {
+		ttl := fmt.Sprintf("%ds", int(convergenceTTL.Seconds()))
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "convergence_allow",
+			Type:    "ipv4_addr",
+			Timeout: ttl,
+		})
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "convergence_drop",
+			Type:    "ipv4_addr",
+			Timeout: ttl,
+		})
+	}
 	if local {
 		table.Chains = []nftChainSpec{
 			{Chain: "INPUT", Header: "type filter hook input priority filter; policy accept;"},
@@ -130,6 +186,9 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 		c := &table.Chains[i]
 		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK")
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
+		if convergenceEnabled {
+			c.Rules = append(c.Rules, convergenceLookupRules(rst)...)
+		}
 		if offloadEnabled {
 			c.Rules = append(c.Rules, offloadLookupRules(protos, rst)...)
 		}
@@ -219,6 +278,10 @@ type nfqueuePacketIO struct {
 	offloadCtx       context.Context
 	offloadCancel    context.CancelFunc
 
+	offloadConvergence    int
+	offloadConvergenceTTL time.Duration
+	convergenceMap        *convergenceMap
+
 	startPostCommand string
 }
 
@@ -236,6 +299,8 @@ type NFQueuePacketIOConfig struct {
 	OffloadTTL       time.Duration
 	OffloadThreshold int
 	OffloadCIDR      string
+	OffloadConvergence    int
+	OffloadConvergenceTTL time.Duration
 	StartPostCommand string
 }
 
