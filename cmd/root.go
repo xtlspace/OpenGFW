@@ -169,20 +169,22 @@ type cliConfig struct {
 }
 
 type cliConfigIO struct {
-	QueueSize        uint32        `mapstructure:"queueSize"`
-	ReadBuffer       int           `mapstructure:"rcvBuf"`
-	WriteBuffer      int           `mapstructure:"sndBuf"`
-	Local            bool          `mapstructure:"local"`
-	RST              bool          `mapstructure:"rst"`
-	TCP              bool          `mapstructure:"tcp"`
-	UDP              bool          `mapstructure:"udp"`
-	IPv4             bool          `mapstructure:"ipv4"`
-	IPv6             bool          `mapstructure:"ipv6"`
-	Offload          bool          `mapstructure:"offload"`
-	OffloadTTL       time.Duration `mapstructure:"offloadTtl"`
-	OffloadThreshold int           `mapstructure:"offloadThreshold"`
-	OffloadCIDR      string        `mapstructure:"offloadCidr"`
-	StartPostCommand string        `mapstructure:"startPostCommand"`
+	QueueSize             uint32        `mapstructure:"queueSize"`
+	ReadBuffer            int           `mapstructure:"rcvBuf"`
+	WriteBuffer           int           `mapstructure:"sndBuf"`
+	Local                 bool          `mapstructure:"local"`
+	RST                   bool          `mapstructure:"rst"`
+	TCP                   bool          `mapstructure:"tcp"`
+	UDP                   bool          `mapstructure:"udp"`
+	IPv4                  bool          `mapstructure:"ipv4"`
+	IPv6                  bool          `mapstructure:"ipv6"`
+	Offload               bool          `mapstructure:"offload"`
+	OffloadTTL            time.Duration `mapstructure:"offloadTtl"`
+	OffloadThreshold      int           `mapstructure:"offloadThreshold"`
+	OffloadCIDR           string        `mapstructure:"offloadCidr"`
+	OffloadConvergence    int           `mapstructure:"offloadConvergence"`
+	OffloadConvergenceTTL time.Duration `mapstructure:"offloadConvergenceTtl"`
+	StartPostCommand      string        `mapstructure:"startPostCommand"`
 }
 
 type cliConfigWorkers struct {
@@ -205,20 +207,22 @@ func (c *cliConfig) fillLogger(config *engine.Config) error {
 
 func (c *cliConfig) fillIO(config *engine.Config) error {
 	nfio, err := io.NewNFQueuePacketIO(io.NFQueuePacketIOConfig{
-		QueueSize:        c.IO.QueueSize,
-		ReadBuffer:       c.IO.ReadBuffer,
-		WriteBuffer:      c.IO.WriteBuffer,
-		Local:            c.IO.Local,
-		RST:              c.IO.RST,
-		TCP:              c.IO.TCP,
-		UDP:              c.IO.UDP,
-		IPv4:             c.IO.IPv4,
-		IPv6:             c.IO.IPv6,
-		Offload:          c.IO.Offload,
-		OffloadTTL:       c.IO.OffloadTTL,
-		OffloadThreshold: c.IO.OffloadThreshold,
-		OffloadCIDR:      c.IO.OffloadCIDR,
-		StartPostCommand: c.IO.StartPostCommand,
+		QueueSize:             c.IO.QueueSize,
+		ReadBuffer:            c.IO.ReadBuffer,
+		WriteBuffer:           c.IO.WriteBuffer,
+		Local:                 c.IO.Local,
+		RST:                   c.IO.RST,
+		TCP:                   c.IO.TCP,
+		UDP:                   c.IO.UDP,
+		IPv4:                  c.IO.IPv4,
+		IPv6:                  c.IO.IPv6,
+		Offload:               c.IO.Offload,
+		OffloadTTL:            c.IO.OffloadTTL,
+		OffloadThreshold:      c.IO.OffloadThreshold,
+		OffloadCIDR:           c.IO.OffloadCIDR,
+		OffloadConvergence:    c.IO.OffloadConvergence,
+		OffloadConvergenceTTL: c.IO.OffloadConvergenceTTL,
+		StartPostCommand:      c.IO.StartPostCommand,
 	})
 	if err != nil {
 		return configError{Field: "io", Err: err}

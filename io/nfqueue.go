@@ -92,7 +92,50 @@ type offloadEntry struct {
 	ruleName string
 }
 
-func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration) (*nftTableSpec, error) {
+type convergenceEntry struct {
+	ports    map[uint16]struct{}
+	lastSeen time.Time
+	promoted bool
+}
+
+type convergenceMap struct {
+	mu      sync.Mutex
+	entries map[[4]byte]*convergenceEntry
+}
+
+func newConvergenceMap() *convergenceMap {
+	return &convergenceMap{
+		entries: make(map[[4]byte]*convergenceEntry),
+	}
+}
+
+func (m *convergenceMap) add(ip [4]byte, port uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, exists := m.entries[ip]
+	if !exists {
+		entry = &convergenceEntry{
+			ports:    make(map[uint16]struct{}),
+			lastSeen: time.Now(),
+		}
+		m.entries[ip] = entry
+	}
+	entry.ports[port] = struct{}{}
+	entry.lastSeen = time.Now()
+}
+
+func (m *convergenceMap) cleanup(maxAge time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for ip, entry := range m.entries {
+		if now.Sub(entry.lastSeen) > maxAge {
+			delete(m.entries, ip)
+		}
+	}
+}
+
+func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
 	if local && rst {
 		return nil, errors.New("tcp rst is not supported in local mode")
 	}
@@ -116,6 +159,19 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 			Timeout: ttl,
 		})
 	}
+	if convergenceEnabled {
+		ttl := fmt.Sprintf("%ds", int(convergenceTTL.Seconds()))
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "convergence_allow",
+			Type:    "ipv4_addr",
+			Timeout: ttl,
+		})
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "convergence_drop",
+			Type:    "ipv4_addr",
+			Timeout: ttl,
+		})
+	}
 	if local {
 		table.Chains = []nftChainSpec{
 			{Chain: "INPUT", Header: "type filter hook input priority filter; policy accept;"},
@@ -130,6 +186,9 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 		c := &table.Chains[i]
 		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK")
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
+		if convergenceEnabled {
+			c.Rules = append(c.Rules, convergenceLookupRules(rst)...)
+		}
 		if offloadEnabled {
 			c.Rules = append(c.Rules, offloadLookupRules(protos, rst)...)
 		}
@@ -160,6 +219,20 @@ func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
 		rules = append(rules, "ip saddr . udp sport @offload_allow accept")
 		rules = append(rules, "ip daddr . udp dport @offload_drop counter drop")
 		rules = append(rules, "ip saddr . udp sport @offload_drop counter drop")
+	}
+	return rules
+}
+
+func convergenceLookupRules(rst bool) []string {
+	var rules []string
+	rules = append(rules, "ip saddr @convergence_allow accept")
+	rules = append(rules, "ip daddr @convergence_allow accept")
+	if rst {
+		rules = append(rules, "ip saddr @convergence_drop counter reject with tcp reset")
+		rules = append(rules, "ip daddr @convergence_drop counter reject with tcp reset")
+	} else {
+		rules = append(rules, "ip saddr @convergence_drop counter drop")
+		rules = append(rules, "ip daddr @convergence_drop counter drop")
 	}
 	return rules
 }
@@ -219,24 +292,30 @@ type nfqueuePacketIO struct {
 	offloadCtx       context.Context
 	offloadCancel    context.CancelFunc
 
+	offloadConvergence    int
+	offloadConvergenceTTL time.Duration
+	convergenceMap        *convergenceMap
+
 	startPostCommand string
 }
 
 type NFQueuePacketIOConfig struct {
-	QueueSize        uint32
-	ReadBuffer       int
-	WriteBuffer      int
-	Local            bool
-	RST              bool
-	TCP              bool
-	UDP              bool
-	IPv4             bool
-	IPv6             bool
-	Offload          bool
-	OffloadTTL       time.Duration
-	OffloadThreshold int
-	OffloadCIDR      string
-	StartPostCommand string
+	QueueSize             uint32
+	ReadBuffer            int
+	WriteBuffer           int
+	Local                 bool
+	RST                   bool
+	TCP                   bool
+	UDP                   bool
+	IPv4                  bool
+	IPv6                  bool
+	Offload               bool
+	OffloadTTL            time.Duration
+	OffloadThreshold      int
+	OffloadCIDR           string
+	OffloadConvergence    int
+	OffloadConvergenceTTL time.Duration
+	StartPostCommand      string
 }
 
 func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
@@ -293,6 +372,9 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		if config.OffloadThreshold <= 0 {
 			config.OffloadThreshold = 3
 		}
+		if config.OffloadConvergence > 0 && config.OffloadConvergenceTTL == 0 {
+			config.OffloadConvergenceTTL = 30 * time.Minute
+		}
 	}
 	io := &nfqueuePacketIO{
 		n:     n,
@@ -325,8 +407,16 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		io.offloadCounter = newOffloadCounter()
 		io.offloadCtx, io.offloadCancel = context.WithCancel(context.Background())
 		io.offloadCh = make(chan offloadEntry, 1024)
+		io.offloadConvergence = config.OffloadConvergence
+		io.offloadConvergenceTTL = config.OffloadConvergenceTTL
+		if io.offloadConvergence > 0 {
+			io.convergenceMap = newConvergenceMap()
+		}
 		go io.offloadWorker()
 		go io.offloadCleanup()
+		if io.offloadConvergence > 0 {
+			go io.convergenceCleanup()
+		}
 	}
 	io.startPostCommand = config.StartPostCommand
 	return io, nil
@@ -439,7 +529,7 @@ func (n *nfqueuePacketIO) Close() error {
 }
 
 func (n *nfqueuePacketIO) setupNft(local, rst, remove bool, protos nfProtocolConfig) error {
-	rules, err := generateNftRules(local, rst, protos, n.offloadEnabled, n.offloadTTL)
+	rules, err := generateNftRules(local, rst, protos, n.offloadEnabled, n.offloadTTL, n.offloadConvergence > 0, n.offloadConvergenceTTL)
 	if err != nil {
 		return err
 	}
@@ -624,6 +714,11 @@ func (n *nfqueuePacketIO) offloadWorker() {
 				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
 					set, e.ip.String(), e.port, ttl)
 			}
+			if n.convergenceMap != nil {
+				var ip [4]byte
+				copy(ip[:], e.ip.To4())
+				n.convergenceMap.add(ip, e.port)
+			}
 		}
 		_ = nftAdd(sb.String())
 		batch = batch[:0]
@@ -655,5 +750,43 @@ func (n *nfqueuePacketIO) offloadCleanup() {
 		case <-n.offloadCtx.Done():
 			return
 		}
+	}
+}
+
+func (n *nfqueuePacketIO) convergenceCleanup() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			n.checkConvergence()
+			n.convergenceMap.cleanup(n.offloadConvergenceTTL * 2)
+		case <-n.offloadCtx.Done():
+			return
+		}
+	}
+}
+
+func (n *nfqueuePacketIO) checkConvergence() {
+	n.convergenceMap.mu.Lock()
+	defer n.convergenceMap.mu.Unlock()
+
+	var sb strings.Builder
+	ttl := fmt.Sprintf("%ds", int(n.offloadConvergenceTTL.Seconds()))
+
+	for ip, entry := range n.convergenceMap.entries {
+		if entry.promoted {
+			continue
+		}
+		if len(entry.ports) < n.offloadConvergence {
+			continue
+		}
+		ipStr := net.IP(ip[:]).String()
+		fmt.Fprintf(&sb, "add element inet opengfw convergence_allow { %s timeout %s }\n", ipStr, ttl)
+		entry.promoted = true
+	}
+
+	if sb.Len() > 0 {
+		_ = nftAdd(sb.String())
 	}
 }
