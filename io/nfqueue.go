@@ -760,7 +760,7 @@ func (n *nfqueuePacketIO) convergenceCleanup() {
 		select {
 		case <-ticker.C:
 			n.checkConvergence()
-			n.convergenceMap.cleanup(n.offloadConvergenceTTL * 2)
+			n.convergenceMap.cleanup(n.offloadConvergenceTTL + time.Minute)
 		case <-n.offloadCtx.Done():
 			return
 		}
