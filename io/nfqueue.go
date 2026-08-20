@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/florianl/go-nfqueue"
+	"github.com/google/nftables"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -90,6 +91,25 @@ type offloadEntry struct {
 	port     uint16
 	allow    bool
 	ruleName string
+}
+
+// nftCtx holds the google/nftables connection and set references
+// for runtime element operations (offload hot path).
+type nftCtx struct {
+	conn             *nftables.Conn
+	table            *nftables.Table
+	offloadAllow     *nftables.Set
+	offloadDrop      *nftables.Set
+	convergenceAllow *nftables.Set // nil if convergence disabled
+}
+
+// makeConcatKey builds a concatenated key for ipv4_addr . inet_service sets.
+// Layout: [IPv4 4 bytes][port 2 bytes][padding 2 bytes] = 8 bytes.
+func makeConcatKey(ip net.IP, port uint16) []byte {
+	key := make([]byte, 8)
+	copy(key[:4], ip.To4())
+	binary.BigEndian.PutUint16(key[4:6], port)
+	return key
 }
 
 type convergenceEntry struct {
@@ -291,6 +311,8 @@ type nfqueuePacketIO struct {
 	offloadConvergenceTTL time.Duration
 	convergenceMap        *convergenceMap
 
+	nftCtx *nftCtx // google/nftables runtime context (nil if offload disabled)
+
 	startPostCommand string
 }
 
@@ -407,11 +429,57 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		if io.offloadConvergence > 0 {
 			io.convergenceMap = newConvergenceMap()
 		}
+		if err := io.initNft(); err != nil {
+			n.Close()
+			return nil, fmt.Errorf("init nftables: %w", err)
+		}
 		go io.offloadWorker()
 		go io.offloadCleanup()
 	}
 	io.startPostCommand = config.StartPostCommand
 	return io, nil
+}
+
+// initNft creates the nftables table/chains/sets via text commands,
+// then obtains set references via the Go API for runtime element operations.
+func (n *nfqueuePacketIO) initNft() error {
+	// Create full table (including rules) via text commands.
+	// Rules with concatenated set lookups cannot be expressed via the Go API.
+	if err := n.setupNft(n.local, n.rst, false, n.protos); err != nil {
+		return err
+	}
+
+	// Connect via Go API to get set references for runtime operations.
+	conn, err := nftables.New(nftables.AsLasting())
+	if err != nil {
+		return fmt.Errorf("nftables connect: %w", err)
+	}
+
+	table := &nftables.Table{Family: nftables.TableFamilyINet, Name: nftTable}
+
+	offloadAllow, err := conn.GetSetByName(table, "offload_allow")
+	if err != nil {
+		_ = conn.CloseLasting()
+		return fmt.Errorf("get offload_allow set: %w", err)
+	}
+	offloadDrop, err := conn.GetSetByName(table, "offload_drop")
+	if err != nil {
+		_ = conn.CloseLasting()
+		return fmt.Errorf("get offload_drop set: %w", err)
+	}
+	var convergenceAllow *nftables.Set
+	if n.offloadConvergence > 0 {
+		convergenceAllow, _ = conn.GetSetByName(table, "convergence_allow")
+	}
+
+	n.nftCtx = &nftCtx{
+		conn:             conn,
+		table:            table,
+		offloadAllow:     offloadAllow,
+		offloadDrop:      offloadDrop,
+		convergenceAllow: convergenceAllow,
+	}
+	return nil
 }
 
 func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error {
@@ -513,7 +581,13 @@ func (n *nfqueuePacketIO) Close() error {
 	if n.offloadEnabled {
 		n.offloadCancel()
 	}
-	if n.rSet {
+	if n.nftCtx != nil {
+		n.nftCtx.conn.DelTable(n.nftCtx.table)
+		_ = n.nftCtx.conn.Flush()
+		_ = n.nftCtx.conn.CloseLasting()
+		n.nftCtx = nil
+		n.rSet = false
+	} else if n.rSet {
 		_ = n.setupNft(n.local, n.rst, true, n.protos)
 		n.rSet = false
 	}
@@ -687,32 +761,35 @@ func (n *nfqueuePacketIO) offloadWorker() {
 	for {
 		select {
 		case e := <-n.offloadCh:
-			var sb strings.Builder
-			ttl := fmt.Sprintf("%ds", int(n.offloadTTL.Seconds()))
-			set := "offload_allow"
+			set := n.nftCtx.offloadAllow
 			if !e.allow {
-				set = "offload_drop"
+				set = n.nftCtx.offloadDrop
+			}
+			elem := nftables.SetElement{
+				Key:     makeConcatKey(e.ip, e.port),
+				Timeout: n.offloadTTL,
 			}
 			if e.ruleName != "" {
-				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d comment %q timeout %s }\n",
-					set, e.ip.String(), e.port, e.ruleName, ttl)
-			} else {
-				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
-					set, e.ip.String(), e.port, ttl)
+				elem.Comment = e.ruleName
 			}
-			_ = nftAdd(sb.String())
+			_ = n.nftCtx.conn.SetAddElements(set, []nftables.SetElement{elem})
+			_ = n.nftCtx.conn.Flush()
+
 			if n.convergenceMap != nil {
 				var ip [4]byte
 				copy(ip[:], e.ip.To4())
 				n.convergenceMap.add(ip, e.port)
 				ips := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
-				if len(ips) > 0 {
-					cttl := fmt.Sprintf("%ds", int(n.offloadConvergenceTTL.Seconds()))
-					var c strings.Builder
+				if len(ips) > 0 && n.nftCtx.convergenceAllow != nil {
+					elems := make([]nftables.SetElement, 0, len(ips))
 					for _, ip := range ips {
-						fmt.Fprintf(&c, "add element inet opengfw convergence_allow { %s timeout %s }\n", ip, cttl)
+						elems = append(elems, nftables.SetElement{
+							Key:     ip.To4(),
+							Timeout: n.offloadConvergenceTTL,
+						})
 					}
-					_ = nftAdd(c.String())
+					_ = n.nftCtx.conn.SetAddElements(n.nftCtx.convergenceAllow, elems)
+					_ = n.nftCtx.conn.Flush()
 				}
 			}
 		case <-n.offloadCtx.Done():
