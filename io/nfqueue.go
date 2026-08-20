@@ -93,7 +93,8 @@ type offloadEntry struct {
 }
 
 type convergenceEntry struct {
-	ports map[uint16]struct{}
+	ports     map[uint16]struct{}
+	firstSeen time.Time
 }
 
 type convergenceMap struct {
@@ -113,18 +114,24 @@ func (m *convergenceMap) add(ip [4]byte, port uint16) {
 	entry, exists := m.entries[ip]
 	if !exists {
 		entry = &convergenceEntry{
-			ports: make(map[uint16]struct{}),
+			ports:     make(map[uint16]struct{}),
+			firstSeen: time.Now(),
 		}
 		m.entries[ip] = entry
 	}
 	entry.ports[port] = struct{}{}
 }
 
-func (m *convergenceMap) checkAndPromote(threshold int) []net.IP {
+func (m *convergenceMap) checkAndPromote(threshold int, maxAge time.Duration) []net.IP {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
 	var result []net.IP
 	for ip, entry := range m.entries {
+		if now.Sub(entry.firstSeen) > maxAge {
+			delete(m.entries, ip)
+			continue
+		}
 		if len(entry.ports) >= threshold {
 			ipCopy := make(net.IP, 4)
 			copy(ipCopy, ip[:])
@@ -166,11 +173,6 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 			Type:    "ipv4_addr",
 			Timeout: ttl,
 		})
-		table.Sets = append(table.Sets, nftSetSpec{
-			Name:    "convergence_drop",
-			Type:    "ipv4_addr",
-			Timeout: ttl,
-		})
 	}
 	if local {
 		table.Chains = []nftChainSpec{
@@ -187,7 +189,7 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK")
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
 		if convergenceEnabled {
-			c.Rules = append(c.Rules, convergenceLookupRules(rst)...)
+			c.Rules = append(c.Rules, convergenceLookupRules()...)
 		}
 		if offloadEnabled {
 			c.Rules = append(c.Rules, offloadLookupRules(protos, rst)...)
@@ -223,17 +225,10 @@ func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
 	return rules
 }
 
-func convergenceLookupRules(rst bool) []string {
+func convergenceLookupRules() []string {
 	var rules []string
 	rules = append(rules, "ip saddr @convergence_allow accept")
 	rules = append(rules, "ip daddr @convergence_allow accept")
-	if rst {
-		rules = append(rules, "ip saddr @convergence_drop counter reject with tcp reset")
-		rules = append(rules, "ip daddr @convergence_drop counter reject with tcp reset")
-	} else {
-		rules = append(rules, "ip saddr @convergence_drop counter drop")
-		rules = append(rules, "ip daddr @convergence_drop counter drop")
-	}
 	return rules
 }
 
@@ -689,17 +684,11 @@ func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool, ruleName string)
 }
 
 func (n *nfqueuePacketIO) offloadWorker() {
-	var batch []offloadEntry
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		var sb strings.Builder
-		ttl := fmt.Sprintf("%ds", int(n.offloadTTL.Seconds()))
-		for _, e := range batch {
+	for {
+		select {
+		case e := <-n.offloadCh:
+			var sb strings.Builder
+			ttl := fmt.Sprintf("%ds", int(n.offloadTTL.Seconds()))
 			set := "offload_allow"
 			if !e.allow {
 				set = "offload_drop"
@@ -711,38 +700,22 @@ func (n *nfqueuePacketIO) offloadWorker() {
 				fmt.Fprintf(&sb, "add element inet opengfw %s { %s . %d timeout %s }\n",
 					set, e.ip.String(), e.port, ttl)
 			}
+			_ = nftAdd(sb.String())
 			if n.convergenceMap != nil {
 				var ip [4]byte
 				copy(ip[:], e.ip.To4())
 				n.convergenceMap.add(ip, e.port)
-			}
-		}
-		_ = nftAdd(sb.String())
-		batch = batch[:0]
-		if n.convergenceMap != nil {
-			ips := n.convergenceMap.checkAndPromote(n.offloadConvergence)
-			if len(ips) > 0 {
-				ttl := fmt.Sprintf("%ds", int(n.offloadConvergenceTTL.Seconds()))
-				var c strings.Builder
-				for _, ip := range ips {
-					fmt.Fprintf(&c, "add element inet opengfw convergence_allow { %s timeout %s }\n", ip, ttl)
+				ips := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
+				if len(ips) > 0 {
+					cttl := fmt.Sprintf("%ds", int(n.offloadConvergenceTTL.Seconds()))
+					var c strings.Builder
+					for _, ip := range ips {
+						fmt.Fprintf(&c, "add element inet opengfw convergence_allow { %s timeout %s }\n", ip, cttl)
+					}
+					_ = nftAdd(c.String())
 				}
-				_ = nftAdd(c.String())
 			}
-		}
-	}
-
-	for {
-		select {
-		case entry := <-n.offloadCh:
-			batch = append(batch, entry)
-			if len(batch) >= 100 {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
 		case <-n.offloadCtx.Done():
-			flush()
 			return
 		}
 	}
