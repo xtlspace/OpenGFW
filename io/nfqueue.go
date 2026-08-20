@@ -93,9 +93,7 @@ type offloadEntry struct {
 }
 
 type convergenceEntry struct {
-	ports    map[uint16]struct{}
-	lastSeen time.Time
-	promoted bool
+	ports map[uint16]struct{}
 }
 
 type convergenceMap struct {
@@ -115,24 +113,26 @@ func (m *convergenceMap) add(ip [4]byte, port uint16) {
 	entry, exists := m.entries[ip]
 	if !exists {
 		entry = &convergenceEntry{
-			ports:    make(map[uint16]struct{}),
-			lastSeen: time.Now(),
+			ports: make(map[uint16]struct{}),
 		}
 		m.entries[ip] = entry
 	}
 	entry.ports[port] = struct{}{}
-	entry.lastSeen = time.Now()
 }
 
-func (m *convergenceMap) cleanup(maxAge time.Duration) {
+func (m *convergenceMap) checkAndPromote(threshold int) []net.IP {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now()
+	var result []net.IP
 	for ip, entry := range m.entries {
-		if now.Sub(entry.lastSeen) > maxAge {
+		if len(entry.ports) >= threshold {
+			ipCopy := make(net.IP, 4)
+			copy(ipCopy, ip[:])
+			result = append(result, ipCopy)
 			delete(m.entries, ip)
 		}
 	}
+	return result
 }
 
 func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
@@ -414,9 +414,6 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		}
 		go io.offloadWorker()
 		go io.offloadCleanup()
-		if io.offloadConvergence > 0 {
-			go io.convergenceCleanup()
-		}
 	}
 	io.startPostCommand = config.StartPostCommand
 	return io, nil
@@ -722,6 +719,17 @@ func (n *nfqueuePacketIO) offloadWorker() {
 		}
 		_ = nftAdd(sb.String())
 		batch = batch[:0]
+		if n.convergenceMap != nil {
+			ips := n.convergenceMap.checkAndPromote(n.offloadConvergence)
+			if len(ips) > 0 {
+				ttl := fmt.Sprintf("%ds", int(n.offloadConvergenceTTL.Seconds()))
+				var c strings.Builder
+				for _, ip := range ips {
+					fmt.Fprintf(&c, "add element inet opengfw convergence_allow { %s timeout %s }\n", ip, ttl)
+				}
+				_ = nftAdd(c.String())
+			}
+		}
 	}
 
 	for {
@@ -750,43 +758,5 @@ func (n *nfqueuePacketIO) offloadCleanup() {
 		case <-n.offloadCtx.Done():
 			return
 		}
-	}
-}
-
-func (n *nfqueuePacketIO) convergenceCleanup() {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			n.checkConvergence()
-			n.convergenceMap.cleanup(n.offloadConvergenceTTL + time.Minute)
-		case <-n.offloadCtx.Done():
-			return
-		}
-	}
-}
-
-func (n *nfqueuePacketIO) checkConvergence() {
-	n.convergenceMap.mu.Lock()
-	defer n.convergenceMap.mu.Unlock()
-
-	var sb strings.Builder
-	ttl := fmt.Sprintf("%ds", int(n.offloadConvergenceTTL.Seconds()))
-
-	for ip, entry := range n.convergenceMap.entries {
-		if entry.promoted {
-			continue
-		}
-		if len(entry.ports) < n.offloadConvergence {
-			continue
-		}
-		ipStr := net.IP(ip[:]).String()
-		fmt.Fprintf(&sb, "add element inet opengfw convergence_allow { %s timeout %s }\n", ipStr, ttl)
-		entry.promoted = true
-	}
-
-	if sb.Len() > 0 {
-		_ = nftAdd(sb.String())
 	}
 }
