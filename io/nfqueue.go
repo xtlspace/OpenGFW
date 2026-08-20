@@ -449,6 +449,9 @@ func (n *nfqueuePacketIO) initNft() error {
 	if err := n.setupNft(n.local, n.rst, false, n.protos); err != nil {
 		return err
 	}
+	// Mark table as set so Register() skips the redundant delete+recreate
+	// that would destroy set references held by offloadWorker.
+	n.rSet = true
 
 	// Connect via Go API to get set references for runtime operations.
 	// Transient mode: each Flush() creates its own socket, avoiding stale
