@@ -95,6 +95,7 @@ type offloadEntry struct {
 
 // nftCtx holds the google/nftables connection and set references
 // for runtime element operations (offload hot path).
+// Uses transient mode (no AsLasting) to avoid stale netlink messages.
 type nftCtx struct {
 	conn             *nftables.Conn
 	table            *nftables.Table
@@ -450,7 +451,9 @@ func (n *nfqueuePacketIO) initNft() error {
 	}
 
 	// Connect via Go API to get set references for runtime operations.
-	conn, err := nftables.New(nftables.AsLasting())
+	// Transient mode: each Flush() creates its own socket, avoiding stale
+	// netlink messages that cause "mismatched sequence" errors with AsLasting().
+	conn, err := nftables.New()
 	if err != nil {
 		return fmt.Errorf("nftables connect: %w", err)
 	}
@@ -459,12 +462,10 @@ func (n *nfqueuePacketIO) initNft() error {
 
 	offloadAllow, err := conn.GetSetByName(table, "offload_allow")
 	if err != nil {
-		_ = conn.CloseLasting()
 		return fmt.Errorf("get offload_allow set: %w", err)
 	}
 	offloadDrop, err := conn.GetSetByName(table, "offload_drop")
 	if err != nil {
-		_ = conn.CloseLasting()
 		return fmt.Errorf("get offload_drop set: %w", err)
 	}
 	var convergenceAllow *nftables.Set
@@ -584,7 +585,6 @@ func (n *nfqueuePacketIO) Close() error {
 	if n.nftCtx != nil {
 		n.nftCtx.conn.DelTable(n.nftCtx.table)
 		_ = n.nftCtx.conn.Flush()
-		_ = n.nftCtx.conn.CloseLasting()
 		n.nftCtx = nil
 		n.rSet = false
 	} else if n.rSet {
