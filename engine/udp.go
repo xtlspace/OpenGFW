@@ -43,6 +43,11 @@ type udpStreamFactory struct {
 
 	RulesetMutex sync.RWMutex
 	Ruleset      ruleset.Ruleset
+
+	// udpAnsScratch is reused by New to collect UDP analyzers without
+	// allocating a new slice for every stream. New is only called from
+	// the worker goroutine that owns this factory.
+	udpAnsScratch []analyzer.UDPAnalyzer
 }
 
 func (f *udpStreamFactory) New(ipFlow, udpFlow gopacket.Flow, udp *layers.UDP, uc *udpContext) *udpStream {
@@ -57,36 +62,51 @@ func (f *udpStreamFactory) New(ipFlow, udpFlow gopacket.Flow, udp *layers.UDP, u
 		DstPort:  uint16(udp.DstPort),
 		Props:    make(analyzer.CombinedPropMap),
 	}
+	info.CacheStrings()
 	f.Logger.UDPStreamNew(f.WorkerID, info)
 	f.RulesetMutex.RLock()
 	rs := f.Ruleset
 	f.RulesetMutex.RUnlock()
-	ans := analyzersToUDPAnalyzers(rs.Analyzers(info))
-	// Create entries for each analyzer
-	entries := make([]*udpStreamEntry, 0, len(ans))
-	for _, a := range ans {
-		entries = append(entries, &udpStreamEntry{
-			Name: a.Name(),
+	f.udpAnsScratch = f.udpAnsScratch[:0]
+	for _, a := range rs.Analyzers(info) {
+		if udpA, ok := a.(analyzer.UDPAnalyzer); ok {
+			f.udpAnsScratch = append(f.udpAnsScratch, udpA)
+		}
+	}
+	ans := f.udpAnsScratch
+	// Allocate entries, loggers and the active pointer slice contiguously so
+	// creating a stream costs a constant number of allocations instead of
+	// one per analyzer.
+	entries := make([]udpStreamEntry, len(ans))
+	loggers := make([]analyzerLogger, len(ans))
+	active := make([]*udpStreamEntry, len(ans))
+	for i, a := range ans {
+		name := a.Name()
+		limit := a.Limit()
+		loggers[i] = analyzerLogger{
+			StreamID: id.Int64(),
+			Name:     name,
+			Logger:   f.Logger,
+		}
+		entries[i] = udpStreamEntry{
+			Name: name,
 			Stream: a.NewUDP(analyzer.UDPInfo{
 				SrcIP:   ipSrc,
 				DstIP:   ipDst,
 				SrcPort: uint16(udp.SrcPort),
 				DstPort: uint16(udp.DstPort),
-			}, &analyzerLogger{
-				StreamID: id.Int64(),
-				Name:     a.Name(),
-				Logger:   f.Logger,
-			}),
-			HasLimit: a.Limit() > 0,
-			Quota:    a.Limit(),
-		})
+			}, &loggers[i]),
+			HasLimit: limit > 0,
+			Quota:    limit,
+		}
+		active[i] = &entries[i]
 	}
 	return &udpStream{
 		info:          info,
 		virgin:        true,
 		logger:        f.Logger,
 		ruleset:       rs,
-		activeEntries: entries,
+		activeEntries: active,
 	}
 }
 
@@ -130,25 +150,26 @@ func newUDPStreamManager(factory *udpStreamFactory, maxStreams int) (*udpStreamM
 
 func (m *udpStreamManager) MatchWithContext(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP, uc *udpContext) {
 	rev := false
+	udpFlow := udp.TransportFlow()
 	value, ok := m.streams.Get(streamID)
 	if !ok {
 		// New stream
 		value = &udpStreamValue{
-			Stream:  m.factory.New(ipFlow, udp.TransportFlow(), udp, uc),
+			Stream:  m.factory.New(ipFlow, udpFlow, udp, uc),
 			IPFlow:  ipFlow,
-			UDPFlow: udp.TransportFlow(),
+			UDPFlow: udpFlow,
 		}
 		m.streams.Add(streamID, value)
 	} else {
 		// Stream ID exists, but is it really the same stream?
-		ok, rev = value.Match(ipFlow, udp.TransportFlow())
+		ok, rev = value.Match(ipFlow, udpFlow)
 		if !ok {
 			// It's not - close the old stream & replace it with a new one
 			value.Stream.Close()
 			value = &udpStreamValue{
-				Stream:  m.factory.New(ipFlow, udp.TransportFlow(), udp, uc),
+				Stream:  m.factory.New(ipFlow, udpFlow, udp, uc),
 				IPFlow:  ipFlow,
-				UDPFlow: udp.TransportFlow(),
+				UDPFlow: udpFlow,
 			}
 			m.streams.Add(streamID, value)
 		}
@@ -276,16 +297,6 @@ func (s *udpStream) feedEntry(entry *udpStreamEntry, rev bool, data []byte) (upd
 		}
 	}
 	return
-}
-
-func analyzersToUDPAnalyzers(ans []analyzer.Analyzer) []analyzer.UDPAnalyzer {
-	udpAns := make([]analyzer.UDPAnalyzer, 0, len(ans))
-	for _, a := range ans {
-		if udpM, ok := a.(analyzer.UDPAnalyzer); ok {
-			udpAns = append(udpAns, udpM)
-		}
-	}
-	return udpAns
 }
 
 func actionToUDPVerdict(a ruleset.Action) (v udpVerdict, final bool) {

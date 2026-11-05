@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,13 +23,31 @@ import (
 const (
 	nfqueueNum              = 100
 	nfqueueMaxPacketLen     = 0xFFFF
-	nfqueueDefaultQueueSize = 128
+	nfqueueDefaultQueueSize = 1024
+	nfqueueMaxQueues        = 64
+	nfqueueDefaultQueues    = 8
 
 	nfqueueConnMarkAccept = 1001
 	nfqueueConnMarkDrop   = 1002
 
 	nftFamily = "inet"
 	nftTable  = "opengfw"
+)
+
+// Netfilter queue netlink constants used for batch verdict writeback.
+// They mirror the values used by go-nfqueue.
+const (
+	nfqnlSubsysQueue     = 3
+	nfqnlMsgVerdict      = 1
+	nfqnlVerAttrHdr      = 2
+	nfqnlAttrMark        = 8 // CTA_MARK inside the nested conntrack attribute
+	nfqnlAttrPayload     = 10
+	nfqnlAttrCt          = 11
+	nfnetlinkVersion     = 0 // NFNETLINK_V0
+	nfqueueAfFamily      = 0 // AF_UNSPEC, matches the nfqueue.Open config below
+	maxVerdictBatch      = 64
+	maxVerdictBatchBytes = 32 * 1024
+	verdictChanBuffer    = 1024
 )
 
 type offloadKey struct {
@@ -42,47 +61,72 @@ type offloadCounterEntry struct {
 	lastSeen time.Time
 }
 
-type offloadCounter struct {
+const offloadCounterShardCount = 16
+
+type offloadCounterShard struct {
 	mu     sync.Mutex
 	counts map[offloadKey]*offloadCounterEntry
 }
 
+type offloadCounter struct {
+	shards [offloadCounterShardCount]offloadCounterShard
+}
+
 func newOffloadCounter() *offloadCounter {
-	return &offloadCounter{
-		counts: make(map[offloadKey]*offloadCounterEntry),
+	c := &offloadCounter{}
+	for i := range c.shards {
+		c.shards[i].counts = make(map[offloadKey]*offloadCounterEntry)
 	}
+	return c
+}
+
+func (k offloadKey) shard() uint32 {
+	// FNV-1a over the key, masking to the shard count.
+	h := uint32(2166136261)
+	for _, b := range k.ip {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	h ^= uint32(k.port)
+	h *= 16777619
+	return h % offloadCounterShardCount
 }
 
 func (c *offloadCounter) increment(key offloadKey, allow bool, threshold int) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, exists := c.counts[key]
+	shard := &c.shards[key.shard()]
+	now := time.Now()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	entry, exists := shard.counts[key]
 	if !exists {
-		c.counts[key] = &offloadCounterEntry{
+		shard.counts[key] = &offloadCounterEntry{
 			count:    1,
 			allow:    allow,
-			lastSeen: time.Now(),
+			lastSeen: now,
 		}
 		return false
 	}
 	entry.count++
 	entry.allow = allow
-	entry.lastSeen = time.Now()
+	entry.lastSeen = now
 	if entry.count >= threshold {
-		delete(c.counts, key)
+		delete(shard.counts, key)
 		return true
 	}
 	return false
 }
 
 func (c *offloadCounter) cleanup(maxAge time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := time.Now()
-	for key, entry := range c.counts {
-		if now.Sub(entry.lastSeen) > maxAge {
-			delete(c.counts, key)
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		for key, entry := range shard.counts {
+			if now.Sub(entry.lastSeen) > maxAge {
+				delete(shard.counts, key)
+			}
 		}
+		shard.mu.Unlock()
 	}
 }
 
@@ -163,7 +207,7 @@ func (m *convergenceMap) checkAndPromote(threshold int, maxAge time.Duration) []
 	return result
 }
 
-func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
+func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
 	if local && rst {
 		return nil, errors.New("tcp rst is not supported in local mode")
 	}
@@ -173,7 +217,6 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 	}
 	table.Defines = append(table.Defines, fmt.Sprintf("define ACCEPT_CTMARK=%d", nfqueueConnMarkAccept))
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", nfqueueConnMarkDrop))
-	table.Defines = append(table.Defines, fmt.Sprintf("define QUEUE_NUM=%d", nfqueueNum))
 	if offloadEnabled {
 		ttl := fmt.Sprintf("%ds", int(offloadTTL.Seconds()))
 		table.Sets = append(table.Sets, nftSetSpec{
@@ -219,7 +262,7 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, offloadEnabled b
 			c.Rules = append(c.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
 		}
 		c.Rules = append(c.Rules, "ct mark $DROP_CTMARK counter drop")
-		c.Rules = append(c.Rules, protos.queueRules()...)
+		c.Rules = append(c.Rules, protos.queueRules(queueCount)...)
 	}
 	return table, nil
 }
@@ -261,25 +304,36 @@ type nfProtocolConfig struct {
 	IPv6 bool
 }
 
+// queueSpec returns the nftables queue statement for the configured number
+// of queues. With more than one queue, the kernel distributes packets by
+// flow hash so that all packets of a stream land on the same queue.
+func queueSpec(queueCount int) string {
+	if queueCount <= 1 {
+		return fmt.Sprintf("queue num %d", nfqueueNum)
+	}
+	return fmt.Sprintf("queue num %d-%d", nfqueueNum, nfqueueNum+queueCount-1)
+}
+
 // queueRules returns the nftables queue rules to capture the configured
 // protocols. Traffic that does not match is left untouched by the kernel.
-func (c nfProtocolConfig) queueRules() []string {
+func (c nfProtocolConfig) queueRules(queueCount int) []string {
+	spec := queueSpec(queueCount) + " bypass"
 	all := c.TCP && c.UDP && c.IPv4 && c.IPv6
 	if all {
-		return []string{"counter queue num $QUEUE_NUM bypass"}
+		return []string{"counter " + spec}
 	}
 	var rules []string
 	if c.IPv4 && c.TCP {
-		rules = append(rules, "meta nfproto ipv4 meta l4proto tcp counter queue num $QUEUE_NUM bypass")
+		rules = append(rules, "meta nfproto ipv4 meta l4proto tcp counter "+spec)
 	}
 	if c.IPv4 && c.UDP {
-		rules = append(rules, "meta nfproto ipv4 meta l4proto udp counter queue num $QUEUE_NUM bypass")
+		rules = append(rules, "meta nfproto ipv4 meta l4proto udp counter "+spec)
 	}
 	if c.IPv6 && c.TCP {
-		rules = append(rules, "meta nfproto ipv6 meta l4proto tcp counter queue num $QUEUE_NUM bypass")
+		rules = append(rules, "meta nfproto ipv6 meta l4proto tcp counter "+spec)
 	}
 	if c.IPv6 && c.UDP {
-		rules = append(rules, "meta nfproto ipv6 meta l4proto udp counter queue num $QUEUE_NUM bypass")
+		rules = append(rules, "meta nfproto ipv6 meta l4proto udp counter "+spec)
 	}
 	return rules
 }
@@ -288,8 +342,31 @@ var _ PacketIO = (*nfqueuePacketIO)(nil)
 
 var errNotNFQueuePacket = errors.New("not an NFQueue packet")
 
+// nfqueueQueue represents one NFQUEUE and its dedicated verdict sender.
+type nfqueueQueue struct {
+	num    uint16
+	family uint8
+	n      *nfqueue.Nfqueue
+
+	verdictCh chan verdictRequest
+	done      chan struct{}
+	wg        sync.WaitGroup
+}
+
+// verdictRequest is a pending verdict queued by a worker. Converting it to a
+// netlink message happens in the queue's sender goroutine, so workers do not
+// pay for message marshaling or the netlink syscall.
+type verdictRequest struct {
+	id      uint32
+	verdict int
+	mark    uint32
+	hasMark bool
+	payload []byte
+}
+
 type nfqueuePacketIO struct {
-	n *nfqueue.Nfqueue
+	queues     []*nfqueueQueue
+	queueCount int
 
 	local bool
 	rst   bool
@@ -311,6 +388,7 @@ type nfqueuePacketIO struct {
 	offloadConvergence    int
 	offloadConvergenceTTL time.Duration
 	convergenceMap        *convergenceMap
+	offloadWg             sync.WaitGroup
 
 	nftCtx *nftCtx // google/nftables runtime context (nil if offload disabled)
 
@@ -318,7 +396,11 @@ type nfqueuePacketIO struct {
 }
 
 type NFQueuePacketIOConfig struct {
-	QueueSize             uint32
+	QueueSize uint32
+	// Queues is the number of NFQUEUE instances to use. Packets are
+	// distributed across them by flow hash. Zero uses a default of
+	// min(NumCPU, 8); set 1 to disable fanout.
+	Queues                int
 	ReadBuffer            int
 	WriteBuffer           int
 	Local                 bool
@@ -350,37 +432,81 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 	if !config.IPv4 && !config.IPv6 {
 		return nil, errors.New("ipv4 and ipv6 cannot both be disabled")
 	}
-	n, err := nfqueue.Open(&nfqueue.Config{
-		NfQueue:      nfqueueNum,
-		MaxPacketLen: nfqueueMaxPacketLen,
-		MaxQueueLen:  config.QueueSize,
-		Copymode:     nfqueue.NfQnlCopyPacket,
-		Flags:        nfqueue.NfQaCfgFlagConntrack,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if config.ReadBuffer > 0 {
-		err = n.Con.SetReadBuffer(config.ReadBuffer)
-		if err != nil {
-			_ = n.Close()
-			return nil, err
+	queueCount := config.Queues
+	if queueCount <= 0 {
+		queueCount = runtime.NumCPU()
+		if queueCount > nfqueueDefaultQueues {
+			queueCount = nfqueueDefaultQueues
 		}
 	}
-	if config.WriteBuffer > 0 {
-		err = n.Con.SetWriteBuffer(config.WriteBuffer)
+	if queueCount > nfqueueMaxQueues {
+		queueCount = nfqueueMaxQueues
+	}
+	queues := make([]*nfqueueQueue, 0, queueCount)
+	stopQueues := func(list []*nfqueueQueue) {
+		for _, q := range list {
+			select {
+			case <-q.done:
+			default:
+				close(q.done)
+			}
+			q.wg.Wait()
+			_ = q.n.Close()
+		}
+	}
+	for i := 0; i < queueCount; i++ {
+		num := uint16(nfqueueNum + i)
+		nq, err := nfqueue.Open(&nfqueue.Config{
+			NfQueue:      num,
+			AfFamily:     nfqueueAfFamily,
+			MaxPacketLen: nfqueueMaxPacketLen,
+			MaxQueueLen:  config.QueueSize,
+			Copymode:     nfqueue.NfQnlCopyPacket,
+			Flags:        nfqueue.NfQaCfgFlagConntrack,
+		})
 		if err != nil {
-			_ = n.Close()
+			stopQueues(queues)
 			return nil, err
 		}
+		if config.ReadBuffer > 0 {
+			err = nq.Con.SetReadBuffer(config.ReadBuffer)
+			if err != nil {
+				_ = nq.Close()
+				stopQueues(queues)
+				return nil, err
+			}
+		}
+		if config.WriteBuffer > 0 {
+			err = nq.Con.SetWriteBuffer(config.WriteBuffer)
+			if err != nil {
+				_ = nq.Close()
+				stopQueues(queues)
+				return nil, err
+			}
+		}
+		q := &nfqueueQueue{
+			num:       num,
+			family:    nfqueueAfFamily,
+			n:         nq,
+			verdictCh: make(chan verdictRequest, verdictChanBuffer),
+			done:      make(chan struct{}),
+		}
+		q.wg.Add(1)
+		go func(q *nfqueueQueue) {
+			defer q.wg.Done()
+			q.verdictWorker()
+		}(q)
+		queues = append(queues, q)
 	}
 	var offloadCIDR *net.IPNet
 	if config.Offload {
 		if config.OffloadCIDR == "" {
+			stopQueues(queues)
 			return nil, errors.New("offloadCidr is required when offload is enabled")
 		}
 		_, cidr, err := net.ParseCIDR(config.OffloadCIDR)
 		if err != nil {
+			stopQueues(queues)
 			return nil, fmt.Errorf("invalid offloadCidr: %w", err)
 		}
 		offloadCIDR = cidr
@@ -395,9 +521,10 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		}
 	}
 	io := &nfqueuePacketIO{
-		n:     n,
-		local: config.Local,
-		rst:   config.RST,
+		queues:     queues,
+		queueCount: len(queues),
+		local:      config.Local,
+		rst:        config.RST,
 		protos: nfProtocolConfig{
 			TCP:  config.TCP,
 			UDP:  config.UDP,
@@ -431,11 +558,18 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 			io.convergenceMap = newConvergenceMap()
 		}
 		if err := io.initNft(); err != nil {
-			n.Close()
+			stopQueues(io.queues)
 			return nil, fmt.Errorf("init nftables: %w", err)
 		}
-		go io.offloadWorker()
-		go io.offloadCleanup()
+		io.offloadWg.Add(2)
+		go func() {
+			defer io.offloadWg.Done()
+			io.offloadWorker()
+		}()
+		go func() {
+			defer io.offloadWg.Done()
+			io.offloadCleanup()
+		}()
 	}
 	io.startPostCommand = config.StartPostCommand
 	return io, nil
@@ -487,35 +621,39 @@ func (n *nfqueuePacketIO) initNft() error {
 }
 
 func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error {
-	err := n.n.RegisterWithErrorFunc(ctx,
-		func(a nfqueue.Attribute) int {
-			if ok, verdict := n.packetAttributeSanityCheck(a); !ok {
-				if a.PacketID != nil {
-					_ = n.n.SetVerdict(*a.PacketID, verdict)
-				}
-				return 0
-			}
-			p := &nfqueuePacket{
-				id:       *a.PacketID,
-				streamID: ctIDFromCtBytes(*a.Ct),
-				data:     *a.Payload,
-			}
-			return okBoolToInt(cb(p, nil))
-		},
-		func(e error) int {
-			if opErr := (*netlink.OpError)(nil); errors.As(e, &opErr) {
-				if errors.Is(opErr.Err, unix.ENOBUFS) {
-					// Kernel buffer temporarily full, ignore
+	for _, q := range n.queues {
+		q := q
+		err := q.n.RegisterWithErrorFunc(ctx,
+			func(a nfqueue.Attribute) int {
+				if ok, verdict := n.packetAttributeSanityCheck(a); !ok {
+					if a.PacketID != nil {
+						_ = q.n.SetVerdict(*a.PacketID, verdict)
+					}
 					return 0
 				}
-			}
-			return okBoolToInt(cb(nil, e))
-		})
-	if err != nil {
-		return err
+				p := &nfqueuePacket{
+					id:       *a.PacketID,
+					streamID: ctIDFromCtBytes(*a.Ct),
+					data:     *a.Payload,
+					queue:    q,
+				}
+				return okBoolToInt(cb(p, nil))
+			},
+			func(e error) int {
+				if opErr := (*netlink.OpError)(nil); errors.As(e, &opErr) {
+					if errors.Is(opErr.Err, unix.ENOBUFS) {
+						// Kernel buffer temporarily full, ignore
+						return 0
+					}
+				}
+				return okBoolToInt(cb(nil, e))
+			})
+		if err != nil {
+			return err
+		}
 	}
 	if !n.rSet {
-		err = n.setupNft(n.local, n.rst, false, n.protos)
+		err := n.setupNft(n.local, n.rst, false, n.protos)
 		if err != nil {
 			return err
 		}
@@ -554,27 +692,47 @@ func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte, rule
 	if !ok {
 		return &ErrInvalidPacket{Err: errNotNFQueuePacket}
 	}
+	q := nP.queue
 	switch v {
 	case VerdictAccept:
-		return n.n.SetVerdict(nP.id, nfqueue.NfAccept)
+		q.enqueue(verdictRequest{id: nP.id, verdict: nfqueue.NfAccept})
 	case VerdictAcceptModify:
-		return n.n.SetVerdictModPacket(nP.id, nfqueue.NfAccept, newPacket)
+		// The caller may reuse its serialization buffer as soon as we
+		// return, so take a copy before handing the payload to the async
+		// sender.
+		var payload []byte
+		if len(newPacket) > 0 {
+			payload = make([]byte, len(newPacket))
+			copy(payload, newPacket)
+		}
+		q.enqueue(verdictRequest{id: nP.id, verdict: nfqueue.NfAccept, payload: payload})
 	case VerdictAcceptStream:
 		if n.offloadEnabled {
 			n.checkOffload(nP.data, true, ruleName)
 		}
-		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfAccept, nfqueueConnMarkAccept)
+		q.enqueue(verdictRequest{
+			id:      nP.id,
+			verdict: nfqueue.NfAccept,
+			mark:    nfqueueConnMarkAccept,
+			hasMark: true,
+		})
 	case VerdictDrop:
-		return n.n.SetVerdict(nP.id, nfqueue.NfDrop)
+		q.enqueue(verdictRequest{id: nP.id, verdict: nfqueue.NfDrop})
 	case VerdictDropStream:
 		if n.offloadEnabled {
 			n.checkOffload(nP.data, false, ruleName)
 		}
-		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfDrop, nfqueueConnMarkDrop)
+		q.enqueue(verdictRequest{
+			id:      nP.id,
+			verdict: nfqueue.NfDrop,
+			mark:    nfqueueConnMarkDrop,
+			hasMark: true,
+		})
 	default:
 		// Invalid verdict, ignore for now
 		return nil
 	}
+	return nil
 }
 
 func (n *nfqueuePacketIO) ProtectedDialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -584,6 +742,18 @@ func (n *nfqueuePacketIO) ProtectedDialContext(ctx context.Context, network, add
 func (n *nfqueuePacketIO) Close() error {
 	if n.offloadEnabled {
 		n.offloadCancel()
+		// Wait for the offload goroutines to finish before tearing down the
+		// nftables connection they use.
+		n.offloadWg.Wait()
+	}
+	// Stop verdict senders before closing their netlink sockets.
+	for _, q := range n.queues {
+		select {
+		case <-q.done:
+		default:
+			close(q.done)
+		}
+		q.wg.Wait()
 	}
 	if n.nftCtx != nil {
 		n.nftCtx.conn.DelTable(n.nftCtx.table)
@@ -594,11 +764,17 @@ func (n *nfqueuePacketIO) Close() error {
 		_ = n.setupNft(n.local, n.rst, true, n.protos)
 		n.rSet = false
 	}
-	return n.n.Close()
+	var firstErr error
+	for _, q := range n.queues {
+		if err := q.n.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (n *nfqueuePacketIO) setupNft(local, rst, remove bool, protos nfProtocolConfig) error {
-	rules, err := generateNftRules(local, rst, protos, n.offloadEnabled, n.offloadTTL, n.offloadConvergence > 0, n.offloadConvergenceTTL)
+	rules, err := generateNftRules(local, rst, protos, n.queueCount, n.offloadEnabled, n.offloadTTL, n.offloadConvergence > 0, n.offloadConvergenceTTL)
 	if err != nil {
 		return err
 	}
@@ -622,6 +798,7 @@ type nfqueuePacket struct {
 	id       uint32
 	streamID uint32
 	data     []byte
+	queue    *nfqueueQueue
 }
 
 func (p *nfqueuePacket) StreamID() uint32 {
@@ -630,6 +807,106 @@ func (p *nfqueuePacket) StreamID() uint32 {
 
 func (p *nfqueuePacket) Data() []byte {
 	return p.data
+}
+
+// enqueue hands a verdict to the queue's sender goroutine. It blocks when the
+// buffer is full (backpressure) and returns silently once the queue is shut
+// down, in which case the kernel releases the packet when the socket closes.
+func (q *nfqueueQueue) enqueue(req verdictRequest) {
+	select {
+	case q.verdictCh <- req:
+	case <-q.done:
+	}
+}
+
+// verdictWorker collects pending verdicts and writes them to the kernel with
+// one sendmsg per batch instead of one syscall per packet.
+func (q *nfqueueQueue) verdictWorker() {
+	msgs := make([]netlink.Message, 0, maxVerdictBatch)
+	batchBytes := 0
+	for {
+		select {
+		case req := <-q.verdictCh:
+			msgs = msgs[:0]
+			batchBytes = 0
+			msgs = appendVerdictMessage(msgs, q.num, q.family, req)
+			batchBytes += len(msgs[len(msgs)-1].Data) + 16
+		drain:
+			for len(msgs) < maxVerdictBatch && batchBytes < maxVerdictBatchBytes {
+				select {
+				case req := <-q.verdictCh:
+					msgs = appendVerdictMessage(msgs, q.num, q.family, req)
+					batchBytes += len(msgs[len(msgs)-1].Data) + 16
+				default:
+					break drain
+				}
+			}
+			if len(msgs) > 0 {
+				if _, err := q.n.Con.SendMessages(msgs); err != nil {
+					// If the batch is rejected (for example because one
+					// message is too large), retry individually so a single
+					// bad verdict does not discard the rest.
+					for i := range msgs {
+						_, _ = q.n.Con.SendMessages(msgs[i : i+1])
+					}
+				}
+				// Drop references to payload buffers held by the batch.
+				clear(msgs)
+			}
+		case <-q.done:
+			return
+		}
+	}
+}
+
+// appendNetlinkAttr appends a netlink attribute (header + data + padding).
+func appendNetlinkAttr(dst []byte, typ uint16, data []byte) []byte {
+	off := len(dst)
+	dst = append(dst, 0, 0, 0, 0)
+	binary.NativeEndian.PutUint16(dst[off:off+2], uint16(4+len(data)))
+	binary.NativeEndian.PutUint16(dst[off+2:off+4], typ)
+	dst = append(dst, data...)
+	for len(dst)&3 != 0 {
+		dst = append(dst, 0)
+	}
+	return dst
+}
+
+// appendVerdictMessage builds an NFQNL_MSG_VERDICT netlink message. It
+// replicates the wire format used by go-nfqueue so that verdicts can be
+// batched with netlink.Conn.SendMessages.
+func appendVerdictMessage(msgs []netlink.Message, queueNum uint16, family uint8, req verdictRequest) []netlink.Message {
+	size := 4 + 12 + 4 + len(req.payload) + 3
+	if req.hasMark {
+		size += 12
+	}
+	data := make([]byte, 0, size)
+	// nfgenmsg: address family, version, resource id (queue number).
+	data = append(data, family, nfnetlinkVersion, byte(queueNum>>8), byte(queueNum))
+
+	var verdictHdr [8]byte
+	binary.BigEndian.PutUint32(verdictHdr[0:4], uint32(req.verdict))
+	binary.BigEndian.PutUint32(verdictHdr[4:8], req.id)
+	data = appendNetlinkAttr(data, nfqnlVerAttrHdr, verdictHdr[:])
+
+	if req.hasMark {
+		var markBuf [4]byte
+		binary.BigEndian.PutUint32(markBuf[:], req.mark)
+		inner := appendNetlinkAttr(nil, nfqnlAttrMark, markBuf[:])
+		data = appendNetlinkAttr(data, netlink.Nested|nfqnlAttrCt, inner)
+	}
+	if len(req.payload) > 0 {
+		data = appendNetlinkAttr(data, nfqnlAttrPayload, req.payload)
+	}
+
+	msgs = append(msgs, netlink.Message{
+		Header: netlink.Header{
+			Type:  netlink.HeaderType((nfqnlSubsysQueue << 8) | nfqnlMsgVerdict),
+			Flags: netlink.Request,
+		},
+		Data: data,
+	})
+	return msgs
 }
 
 func okBoolToInt(ok bool) int {
@@ -707,14 +984,27 @@ func (c *nftChainSpec) String() string {
 }
 
 func ctIDFromCtBytes(ct []byte) uint32 {
-	ctAttrs, err := netlink.UnmarshalAttributes(ct)
-	if err != nil {
-		return 0
-	}
-	for _, attr := range ctAttrs {
-		if attr.Type == 12 { // CTA_ID
-			return binary.BigEndian.Uint32(attr.Data)
+	// Parse netlink attributes manually instead of calling
+	// netlink.UnmarshalAttributes, which allocates a slice for every packet.
+	// We only need CTA_ID (12).
+	for len(ct) >= 4 {
+		length := int(binary.NativeEndian.Uint16(ct[0:2]))
+		attrType := binary.NativeEndian.Uint16(ct[2:4]) & 0x3fff
+		if length < 4 || length > len(ct) {
+			return 0
 		}
+		if attrType == 12 { // CTA_ID
+			if length < 8 {
+				return 0
+			}
+			return binary.BigEndian.Uint32(ct[4:8])
+		}
+		// Attributes are 4-byte aligned.
+		aligned := (length + 3) &^ 3
+		if aligned > len(ct) {
+			return 0
+		}
+		ct = ct[aligned:]
 	}
 	return 0
 }
@@ -761,27 +1051,60 @@ func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool, ruleName string)
 }
 
 func (n *nfqueuePacketIO) offloadWorker() {
+	// maxOffloadBatch bounds how many set elements are accumulated before
+	// a single nftables flush. Batching avoids opening/closing a netlink
+	// socket for every offloaded stream.
+	const maxOffloadBatch = 256
+	allowElems := make([]nftables.SetElement, 0, maxOffloadBatch)
+	dropElems := make([]nftables.SetElement, 0, maxOffloadBatch)
+
+	appendElement := func(e offloadEntry) {
+		set := &allowElems
+		if !e.allow {
+			set = &dropElems
+		}
+		elem := nftables.SetElement{
+			Key:     makeConcatKey(e.ip, e.port),
+			Timeout: n.offloadTTL,
+		}
+		if e.ruleName != "" {
+			elem.Comment = e.ruleName
+		}
+		*set = append(*set, elem)
+		if n.convergenceMap != nil {
+			var ip [4]byte
+			copy(ip[:], e.ip.To4())
+			n.convergenceMap.add(ip, e.port)
+		}
+	}
+
 	for {
 		select {
 		case e := <-n.offloadCh:
-			set := n.nftCtx.offloadAllow
-			if !e.allow {
-				set = n.nftCtx.offloadDrop
+			allowElems = allowElems[:0]
+			dropElems = dropElems[:0]
+			appendElement(e)
+		drain:
+			for len(allowElems)+len(dropElems) < maxOffloadBatch {
+				select {
+				case e2 := <-n.offloadCh:
+					appendElement(e2)
+				default:
+					break drain
+				}
 			}
-			elem := nftables.SetElement{
-				Key:     makeConcatKey(e.ip, e.port),
-				Timeout: n.offloadTTL,
+
+			if len(allowElems) > 0 {
+				_ = n.nftCtx.conn.SetAddElements(n.nftCtx.offloadAllow, allowElems)
 			}
-			if e.ruleName != "" {
-				elem.Comment = e.ruleName
+			if len(dropElems) > 0 {
+				_ = n.nftCtx.conn.SetAddElements(n.nftCtx.offloadDrop, dropElems)
 			}
-			_ = n.nftCtx.conn.SetAddElements(set, []nftables.SetElement{elem})
-			_ = n.nftCtx.conn.Flush()
+			if len(allowElems) > 0 || len(dropElems) > 0 {
+				_ = n.nftCtx.conn.Flush()
+			}
 
 			if n.convergenceMap != nil {
-				var ip [4]byte
-				copy(ip[:], e.ip.To4())
-				n.convergenceMap.add(ip, e.port)
 				ips := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
 				if len(ips) > 0 && n.nftCtx.convergenceAllow != nil {
 					elems := make([]nftables.SetElement, 0, len(ips))

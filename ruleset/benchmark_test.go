@@ -40,6 +40,7 @@ func BenchmarkMatch(b *testing.B) {
 			"socks": analyzer.PropMap{"version": 5, "addr": "example.com", "port": 443},
 		},
 	}
+	info.CacheStrings()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rs.Match(info)

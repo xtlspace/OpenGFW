@@ -64,19 +64,63 @@ const (
 	ProtocolUDP
 )
 
+type streamStringCache struct {
+	srcIP, dstIP string
+	src, dst     string
+}
+
 type StreamInfo struct {
 	ID               int64
 	Protocol         Protocol
 	SrcIP, DstIP     net.IP
 	SrcPort, DstPort uint16
 	Props            analyzer.CombinedPropMap
+
+	// cache holds the precomputed textual forms of the endpoints.
+	// It is optional and only set by CacheStrings.
+	cache *streamStringCache
+}
+
+// CacheStrings precomputes the textual representations of the stream
+// endpoints. StreamInfo is frequently logged and matched against rules,
+// and net.IP.String plus net.JoinHostPort allocate on every call, so
+// caching them once per stream avoids repeated allocations in hot paths.
+func (i *StreamInfo) CacheStrings() {
+	if i.cache == nil {
+		i.cache = &streamStringCache{}
+	}
+	c := i.cache
+	c.srcIP = i.SrcIP.String()
+	c.dstIP = i.DstIP.String()
+	c.src = net.JoinHostPort(c.srcIP, strconv.Itoa(int(i.SrcPort)))
+	c.dst = net.JoinHostPort(c.dstIP, strconv.Itoa(int(i.DstPort)))
+}
+
+func (i StreamInfo) srcIPString() string {
+	if i.cache != nil {
+		return i.cache.srcIP
+	}
+	return i.SrcIP.String()
+}
+
+func (i StreamInfo) dstIPString() string {
+	if i.cache != nil {
+		return i.cache.dstIP
+	}
+	return i.DstIP.String()
 }
 
 func (i StreamInfo) SrcString() string {
+	if i.cache != nil {
+		return i.cache.src
+	}
 	return net.JoinHostPort(i.SrcIP.String(), strconv.Itoa(int(i.SrcPort)))
 }
 
 func (i StreamInfo) DstString() string {
+	if i.cache != nil {
+		return i.cache.dst
+	}
 	return net.JoinHostPort(i.DstIP.String(), strconv.Itoa(int(i.DstPort)))
 }
 

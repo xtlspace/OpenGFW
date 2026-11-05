@@ -170,6 +170,7 @@ type cliConfig struct {
 
 type cliConfigIO struct {
 	QueueSize             uint32        `mapstructure:"queueSize"`
+	Queues                int           `mapstructure:"queues"`
 	ReadBuffer            int           `mapstructure:"rcvBuf"`
 	WriteBuffer           int           `mapstructure:"sndBuf"`
 	Local                 bool          `mapstructure:"local"`
@@ -208,6 +209,7 @@ func (c *cliConfig) fillLogger(config *engine.Config) error {
 func (c *cliConfig) fillIO(config *engine.Config) error {
 	nfio, err := io.NewNFQueuePacketIO(io.NFQueuePacketIOConfig{
 		QueueSize:             c.IO.QueueSize,
+		Queues:                c.IO.Queues,
 		ReadBuffer:            c.IO.ReadBuffer,
 		WriteBuffer:           c.IO.WriteBuffer,
 		Local:                 c.IO.Local,
@@ -337,112 +339,140 @@ func runMain(cmd *cobra.Command, args []string) {
 type engineLogger struct{}
 
 func (l *engineLogger) WorkerStart(id int) {
-	logger.Debug("worker started", zap.Int("id", id))
+	if ce := logger.Check(zapcore.DebugLevel, "worker started"); ce != nil {
+		ce.Write(zap.Int("id", id))
+	}
 }
 
 func (l *engineLogger) WorkerStop(id int) {
-	logger.Debug("worker stopped", zap.Int("id", id))
+	if ce := logger.Check(zapcore.DebugLevel, "worker stopped"); ce != nil {
+		ce.Write(zap.Int("id", id))
+	}
 }
 
 func (l *engineLogger) TCPStreamNew(workerID int, info ruleset.StreamInfo) {
-	logger.Debug("new TCP stream",
-		zap.Int("workerID", workerID),
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()))
+	if ce := logger.Check(zapcore.DebugLevel, "new TCP stream"); ce != nil {
+		ce.Write(
+			zap.Int("workerID", workerID),
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()))
+	}
 }
 
 func (l *engineLogger) TCPStreamPropUpdate(info ruleset.StreamInfo, close bool) {
-	logger.Debug("TCP stream property update",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.Any("props", info.Props),
-		zap.Bool("close", close))
+	if ce := logger.Check(zapcore.DebugLevel, "TCP stream property update"); ce != nil {
+		ce.Write(
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.Any("props", info.Props),
+			zap.Bool("close", close))
+	}
 }
 
 func (l *engineLogger) TCPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool) {
-	logger.Info("TCP stream action",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.String("action", action.String()),
-		zap.Bool("noMatch", noMatch))
+	if ce := logger.Check(zapcore.InfoLevel, "TCP stream action"); ce != nil {
+		ce.Write(
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()),
+			zap.Bool("noMatch", noMatch))
+	}
 }
 
 func (l *engineLogger) UDPStreamNew(workerID int, info ruleset.StreamInfo) {
-	logger.Debug("new UDP stream",
-		zap.Int("workerID", workerID),
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()))
+	if ce := logger.Check(zapcore.DebugLevel, "new UDP stream"); ce != nil {
+		ce.Write(
+			zap.Int("workerID", workerID),
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()))
+	}
 }
 
 func (l *engineLogger) UDPStreamPropUpdate(info ruleset.StreamInfo, close bool) {
-	logger.Debug("UDP stream property update",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.Any("props", info.Props),
-		zap.Bool("close", close))
+	if ce := logger.Check(zapcore.DebugLevel, "UDP stream property update"); ce != nil {
+		ce.Write(
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.Any("props", info.Props),
+			zap.Bool("close", close))
+	}
 }
 
 func (l *engineLogger) UDPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool) {
-	logger.Info("UDP stream action",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.String("action", action.String()),
-		zap.Bool("noMatch", noMatch))
+	if ce := logger.Check(zapcore.InfoLevel, "UDP stream action"); ce != nil {
+		ce.Write(
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()),
+			zap.Bool("noMatch", noMatch))
+	}
 }
 
 func (l *engineLogger) ModifyError(info ruleset.StreamInfo, err error) {
-	logger.Error("modify error",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.Error(err))
+	if ce := logger.Check(zapcore.ErrorLevel, "modify error"); ce != nil {
+		ce.Write(
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.Error(err))
+	}
 }
 
 func (l *engineLogger) AnalyzerDebugf(streamID int64, name string, format string, args ...interface{}) {
-	logger.Debug("analyzer debug message",
-		zap.Int64("id", streamID),
-		zap.String("name", name),
-		zap.String("msg", fmt.Sprintf(format, args...)))
+	if ce := logger.Check(zapcore.DebugLevel, "analyzer debug message"); ce != nil {
+		ce.Write(
+			zap.Int64("id", streamID),
+			zap.String("name", name),
+			zap.String("msg", fmt.Sprintf(format, args...)))
+	}
 }
 
 func (l *engineLogger) AnalyzerInfof(streamID int64, name string, format string, args ...interface{}) {
-	logger.Info("analyzer info message",
-		zap.Int64("id", streamID),
-		zap.String("name", name),
-		zap.String("msg", fmt.Sprintf(format, args...)))
+	if ce := logger.Check(zapcore.InfoLevel, "analyzer info message"); ce != nil {
+		ce.Write(
+			zap.Int64("id", streamID),
+			zap.String("name", name),
+			zap.String("msg", fmt.Sprintf(format, args...)))
+	}
 }
 
 func (l *engineLogger) AnalyzerErrorf(streamID int64, name string, format string, args ...interface{}) {
-	logger.Error("analyzer error message",
-		zap.Int64("id", streamID),
-		zap.String("name", name),
-		zap.String("msg", fmt.Sprintf(format, args...)))
+	if ce := logger.Check(zapcore.ErrorLevel, "analyzer error message"); ce != nil {
+		ce.Write(
+			zap.Int64("id", streamID),
+			zap.String("name", name),
+			zap.String("msg", fmt.Sprintf(format, args...)))
+	}
 }
 
 type rulesetLogger struct{}
 
 func (l *rulesetLogger) Log(info ruleset.StreamInfo, name string) {
-	logger.Info("ruleset log",
-		zap.String("name", name),
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.Any("props", info.Props))
+	if ce := logger.Check(zapcore.InfoLevel, "ruleset log"); ce != nil {
+		ce.Write(
+			zap.String("name", name),
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.Any("props", info.Props))
+	}
 }
 
 func (l *rulesetLogger) MatchError(info ruleset.StreamInfo, name string, err error) {
-	logger.Error("ruleset match error",
-		zap.String("name", name),
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.Error(err))
+	if ce := logger.Check(zapcore.ErrorLevel, "ruleset match error"); ce != nil {
+		ce.Write(
+			zap.String("name", name),
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.Error(err))
+	}
 }
 
 func envOrDefaultString(key, def string) string {

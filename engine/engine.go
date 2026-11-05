@@ -6,9 +6,6 @@ import (
 
 	"github.com/apernet/OpenGFW/io"
 	"github.com/apernet/OpenGFW/ruleset"
-
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 )
 
 var _ Engine = (*engine)(nil)
@@ -17,6 +14,10 @@ type engine struct {
 	logger  Logger
 	io      io.PacketIO
 	workers []*worker
+
+	// workerMask is len(workers)-1 when the worker count is a power of two,
+	// allowing modulo-free stream-to-worker load balancing.
+	workerMask uint32
 }
 
 func NewEngine(config Config) (Engine, error) {
@@ -35,15 +36,21 @@ func NewEngine(config Config) (Engine, error) {
 			TCPMaxBufferedPagesTotal:   config.WorkerTCPMaxBufferedPagesTotal,
 			TCPMaxBufferedPagesPerConn: config.WorkerTCPMaxBufferedPagesPerConn,
 			UDPMaxStreams:              config.WorkerUDPMaxStreams,
+			PacketIO:                   config.IO,
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
+	var workerMask uint32
+	if workerCount > 0 && workerCount&(workerCount-1) == 0 {
+		workerMask = uint32(workerCount - 1)
+	}
 	return &engine{
-		logger:  config.Logger,
-		io:      config.IO,
-		workers: workers,
+		logger:     config.Logger,
+		io:         config.IO,
+		workers:    workers,
+		workerMask: workerMask,
 	}, nil
 }
 
@@ -69,7 +76,12 @@ func (e *engine) Run(ctx context.Context) error {
 	errChan := make(chan error, 1)
 	err := e.io.Register(ioCtx, func(p io.Packet, err error) bool {
 		if err != nil {
-			errChan <- err
+			// Multiple queue readers may report errors concurrently; only the
+			// first one matters, so never block the callback.
+			select {
+			case errChan <- err:
+			default:
+			}
 			return false
 		}
 		return e.dispatch(p)
@@ -90,26 +102,36 @@ func (e *engine) Run(ctx context.Context) error {
 // dispatch dispatches a packet to a worker.
 func (e *engine) dispatch(p io.Packet) bool {
 	data := p.Data()
+	if len(data) < 1 {
+		_ = e.io.SetVerdict(p, io.VerdictAcceptStream, nil, "")
+		return true
+	}
 	ipVersion := data[0] >> 4
-	var layerType gopacket.LayerType
-	if ipVersion == 4 {
-		layerType = layers.LayerTypeIPv4
-	} else if ipVersion == 6 {
-		layerType = layers.LayerTypeIPv6
-	} else {
+	if ipVersion != 4 && ipVersion != 6 {
 		// Unsupported network layer
 		_ = e.io.SetVerdict(p, io.VerdictAcceptStream, nil, "")
 		return true
 	}
 	// Load balance by stream ID
-	index := p.StreamID() % uint32(len(e.workers))
-	packet := gopacket.NewPacket(data, layerType, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
-	e.workers[index].Feed(&workerPacket{
-		StreamID: p.StreamID(),
-		Packet:   packet,
-		SetVerdict: func(v io.Verdict, b []byte, ruleName string) error {
-			return e.io.SetVerdict(p, v, b, ruleName)
-		},
-	})
+	streamID := p.StreamID()
+	var index uint32
+	if e.workerMask != 0 {
+		index = streamID & e.workerMask
+	} else {
+		index = streamID % uint32(len(e.workers))
+	}
+	w := e.workers[index]
+	pkt := w.packetPool.Get().(*workerPacket)
+	pkt.StreamID = streamID
+	pkt.Data = data
+	pkt.Packet = p
+	if !w.Feed(pkt) {
+		// The worker has stopped (shutdown). Recycle the packet and release
+		// it so the IO read goroutine is never blocked indefinitely.
+		pkt.Data = nil
+		pkt.Packet = nil
+		w.packetPool.Put(pkt)
+		_ = e.io.SetVerdict(p, io.VerdictAccept, nil, "")
+	}
 	return true
 }

@@ -112,48 +112,65 @@ type geositeDomain struct {
 }
 
 type geositeMatcher struct {
-	Domains []geositeDomain
+	// Domains are partitioned by type so that matching does not need to
+	// scan every domain in the list. Full and RootDomain lookups become
+	// map accesses; only Plain still requires a substring scan.
+	Full  map[string][]geositeDomain
+	Root  map[string][]geositeDomain
+	Plain []geositeDomain
+	Regex []geositeDomain
 	// Attributes are matched using "and" logic - if you have multiple attributes here,
 	// a domain must have all of those attributes to be considered a match.
 	Attrs []string
 }
 
-func (m *geositeMatcher) matchDomain(domain geositeDomain, host HostInfo) bool {
-	// Match attributes first
-	if len(m.Attrs) > 0 {
-		if len(domain.Attrs) == 0 {
-			return false
-		}
-		for _, attr := range m.Attrs {
-			if !domain.Attrs[attr] {
-				return false
-			}
-		}
+func (m *geositeMatcher) matchAttrs(domain geositeDomain) bool {
+	if len(m.Attrs) == 0 {
+		return true
 	}
-
-	switch domain.Type {
-	case geositeDomainPlain:
-		return strings.Contains(host.Name, domain.Value)
-	case geositeDomainRegex:
-		if domain.Regex != nil {
-			return domain.Regex.MatchString(host.Name)
-		}
-	case geositeDomainFull:
-		return host.Name == domain.Value
-	case geositeDomainRoot:
-		if host.Name == domain.Value {
-			return true
-		}
-		return strings.HasSuffix(host.Name, "."+domain.Value)
-	default:
+	if len(domain.Attrs) == 0 {
 		return false
 	}
-	return false
+	for _, attr := range m.Attrs {
+		if !domain.Attrs[attr] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *geositeMatcher) Match(host HostInfo) bool {
-	for _, domain := range m.Domains {
-		if m.matchDomain(domain, host) {
+	name := host.Name
+	if domains, ok := m.Full[name]; ok {
+		for i := range domains {
+			if m.matchAttrs(domains[i]) {
+				return true
+			}
+		}
+	}
+	// RootDomain matches either the domain itself or any subdomain.
+	for suffix := name; ; {
+		if domains, ok := m.Root[suffix]; ok {
+			for i := range domains {
+				if m.matchAttrs(domains[i]) {
+					return true
+				}
+			}
+		}
+		i := strings.IndexByte(suffix, '.')
+		if i < 0 {
+			break
+		}
+		suffix = suffix[i+1:]
+	}
+	for i := range m.Plain {
+		if m.matchAttrs(m.Plain[i]) && strings.Contains(name, m.Plain[i].Value) {
+			return true
+		}
+	}
+	for i := range m.Regex {
+		d := &m.Regex[i]
+		if d.Regex != nil && m.matchAttrs(*d) && d.Regex.MatchString(name) {
 			return true
 		}
 	}
@@ -161,45 +178,41 @@ func (m *geositeMatcher) Match(host HostInfo) bool {
 }
 
 func newGeositeMatcher(list *v2geo.GeoSite, attrs []string) (*geositeMatcher, error) {
-	domains := make([]geositeDomain, len(list.Domain))
-	for i, domain := range list.Domain {
+	m := &geositeMatcher{
+		Full:  make(map[string][]geositeDomain),
+		Root:  make(map[string][]geositeDomain),
+		Plain: make([]geositeDomain, 0, len(list.Domain)),
+		Regex: make([]geositeDomain, 0),
+		Attrs: attrs,
+	}
+	for _, domain := range list.Domain {
+		d := geositeDomain{
+			Value: domain.Value,
+			Attrs: domainAttributeToMap(domain.Attribute),
+		}
 		switch domain.Type {
 		case v2geo.Domain_Plain:
-			domains[i] = geositeDomain{
-				Type:  geositeDomainPlain,
-				Value: domain.Value,
-				Attrs: domainAttributeToMap(domain.Attribute),
-			}
+			d.Type = geositeDomainPlain
+			m.Plain = append(m.Plain, d)
 		case v2geo.Domain_Regex:
 			regex, err := regexp.Compile(domain.Value)
 			if err != nil {
 				return nil, err
 			}
-			domains[i] = geositeDomain{
-				Type:  geositeDomainRegex,
-				Regex: regex,
-				Attrs: domainAttributeToMap(domain.Attribute),
-			}
+			d.Type = geositeDomainRegex
+			d.Regex = regex
+			m.Regex = append(m.Regex, d)
 		case v2geo.Domain_Full:
-			domains[i] = geositeDomain{
-				Type:  geositeDomainFull,
-				Value: domain.Value,
-				Attrs: domainAttributeToMap(domain.Attribute),
-			}
+			d.Type = geositeDomainFull
+			m.Full[d.Value] = append(m.Full[d.Value], d)
 		case v2geo.Domain_RootDomain:
-			domains[i] = geositeDomain{
-				Type:  geositeDomainRoot,
-				Value: domain.Value,
-				Attrs: domainAttributeToMap(domain.Attribute),
-			}
+			d.Type = geositeDomainRoot
+			m.Root[d.Value] = append(m.Root[d.Value], d)
 		default:
 			return nil, errors.New("unsupported domain type")
 		}
 	}
-	return &geositeMatcher{
-		Domains: domains,
-		Attrs:   attrs,
-	}, nil
+	return m, nil
 }
 
 func domainAttributeToMap(attrs []*v2geo.Domain_Attribute) map[string]bool {

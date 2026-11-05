@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/expr-lang/expr/builtin"
@@ -62,6 +63,14 @@ type exprRuleset struct {
 	Rules  []compiledExprRule
 	Ans    []analyzer.Analyzer
 	Logger Logger
+
+	// useXxx record which built-in environment entries are referenced by at
+	// least one rule, so Match can skip populating unused ones (each value
+	// stored in the interface map costs an allocation).
+	useID, useProto, useIP, usePort bool
+
+	vmPool  sync.Pool
+	envPool sync.Pool
 }
 
 func (r *exprRuleset) Analyzers(info StreamInfo) []analyzer.Analyzer {
@@ -69,9 +78,16 @@ func (r *exprRuleset) Analyzers(info StreamInfo) []analyzer.Analyzer {
 }
 
 func (r *exprRuleset) Match(info StreamInfo) MatchResult {
-	env := streamInfoToExprEnv(info)
+	env := r.envPool.Get().(*exprEnv)
+	env.fill(info, r.useID, r.useProto, r.useIP, r.usePort)
+	vmInst := r.vmPool.Get().(*vm.VM)
+	defer func() {
+		r.vmPool.Put(vmInst)
+		env.reset()
+		r.envPool.Put(env)
+	}()
 	for _, rule := range r.Rules {
-		v, err := vm.Run(rule.Program, env)
+		v, err := vmInst.Run(rule.Program, env.m)
 		if err != nil {
 			// Log the error and continue to the next rule.
 			r.Logger.MatchError(info, rule.Name, err)
@@ -104,6 +120,7 @@ func CompileExprRules(rules []ExprRule, ans []analyzer.Analyzer, mods []modifier
 	fullAnMap := analyzersToMap(ans)
 	fullModMap := modifiersToMap(mods)
 	depAnMap := make(map[string]analyzer.Analyzer)
+	usedBuiltins := make(map[string]bool)
 	funcMap := buildFunctionMap(config)
 	// Compile all rules and build a map of analyzers that are used by the rules.
 	for _, rule := range rules {
@@ -142,7 +159,11 @@ func CompileExprRules(rules []ExprRule, ans []analyzer.Analyzer, mods []modifier
 		}
 		for name := range visitor.Identifiers {
 			// Skip built-in analyzers & user-defined variables
-			if isBuiltInAnalyzer(name) || visitor.Variables[name] {
+			if isBuiltInAnalyzer(name) {
+				usedBuiltins[name] = true
+				continue
+			}
+			if visitor.Variables[name] {
 				continue
 			}
 			if f, ok := funcMap[name]; ok {
@@ -181,33 +202,75 @@ func CompileExprRules(rules []ExprRule, ans []analyzer.Analyzer, mods []modifier
 	for _, a := range depAnMap {
 		depAns = append(depAns, a)
 	}
-	return &exprRuleset{
-		Rules:  compiledRules,
-		Ans:    depAns,
-		Logger: config.Logger,
-	}, nil
+	rs := &exprRuleset{
+		Rules:    compiledRules,
+		Ans:      depAns,
+		Logger:   config.Logger,
+		useID:    usedBuiltins["id"],
+		useProto: usedBuiltins["proto"],
+		useIP:    usedBuiltins["ip"],
+		usePort:  usedBuiltins["port"],
+	}
+	rs.initPools()
+	return rs, nil
 }
 
-func streamInfoToExprEnv(info StreamInfo) map[string]interface{} {
-	m := map[string]interface{}{
-		"id":    info.ID,
-		"proto": info.Protocol.String(),
-		"ip": map[string]string{
-			"src": info.SrcIP.String(),
-			"dst": info.DstIP.String(),
-		},
-		"port": map[string]uint16{
-			"src": info.SrcPort,
-			"dst": info.DstPort,
-		},
+func (r *exprRuleset) initPools() {
+	r.vmPool.New = func() any { return &vm.VM{} }
+	r.envPool.New = func() any { return newExprEnv() }
+}
+
+// exprEnv is a reusable expression environment. Reusing the maps across
+// Match calls avoids allocating a fresh environment for every property
+// update, which is one of the hottest paths for long-lived streams.
+type exprEnv struct {
+	m    map[string]interface{}
+	ip   map[string]string
+	port map[string]uint16
+	// anKeys tracks analyzer properties placed in m by the previous fill,
+	// so reset only needs to delete those instead of clearing the whole map.
+	anKeys []string
+}
+
+func newExprEnv() *exprEnv {
+	m := make(map[string]interface{}, 8)
+	ip := make(map[string]string, 2)
+	port := make(map[string]uint16, 2)
+	m["ip"] = ip
+	m["port"] = port
+	return &exprEnv{m: m, ip: ip, port: port}
+}
+
+func (e *exprEnv) reset() {
+	for _, k := range e.anKeys {
+		delete(e.m, k)
+	}
+	e.anKeys = e.anKeys[:0]
+}
+
+func (e *exprEnv) fill(info StreamInfo, useID, useProto, useIP, usePort bool) {
+	e.reset()
+	if useID {
+		e.m["id"] = info.ID
+	}
+	if useProto {
+		e.m["proto"] = info.Protocol.String()
+	}
+	if useIP {
+		e.ip["src"] = info.srcIPString()
+		e.ip["dst"] = info.dstIPString()
+	}
+	if usePort {
+		e.port["src"] = info.SrcPort
+		e.port["dst"] = info.DstPort
 	}
 	for anName, anProps := range info.Props {
 		if len(anProps) != 0 {
 			// Ignore analyzers with empty properties
-			m[anName] = anProps
+			e.m[anName] = anProps
+			e.anKeys = append(e.anKeys, anName)
 		}
 	}
-	return m
 }
 
 func isBuiltInAnalyzer(name string) bool {
@@ -339,6 +402,19 @@ func buildFunctionMap(config *BuiltinConfig) map[string]*Function {
 				return builtins.MatchCIDR(params[0].(string), params[1].(*net.IPNet)), nil
 			},
 			Types: []reflect.Type{reflect.TypeOf(builtins.MatchCIDR)},
+		},
+		// Override the built-in string() conversion. The built-in is
+		// implemented with fmt.Sprintf, which allocates on every call, while
+		// OpenGFW rules routinely use string() on string properties (e.g.
+		// string(tls.sni)). Keep fmt as a fallback for non-string values.
+		"string": {
+			Func: func(params ...any) (any, error) {
+				if s, ok := params[0].(string); ok {
+					return s, nil
+				}
+				return fmt.Sprintf("%v", params[0]), nil
+			},
+			Types: []reflect.Type{reflect.TypeOf(func(any) string { return "" })},
 		},
 		"lookup": {
 			InitFunc: nil,
