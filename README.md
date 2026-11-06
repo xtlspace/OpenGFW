@@ -52,4 +52,5 @@ OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wiki
 - 新增 NFQueue 多队列 fanout：`queue num 100-N` 按 flow hash 分发到多个队列，每个队列独立读取，突破单读线程上限
   - 配置项：`queues`（队列数量，默认 `min(NumCPU, 8)`，设为 1 可关闭）
 - verdict 批量回写：每个队列使用独立 netlink 发送协程，通过单次 `sendmsg` 批量提交多个 verdict，减少系统调用
+- offload convergence 区分 allow/drop：新增 `convergence_drop` 集合，阻断型 IP 不会再被错误提升到 `convergence_allow`；convergence_drop 规则优先于 connmark 放行、convergence_allow 和 offload
 - 规则匹配与每包路径优化：复用 expr 环境/VM、缓存流地址字符串、sharded offload 计数、批量 nftables 写入、零分配 conntrack ID 解析、日志惰性求值等

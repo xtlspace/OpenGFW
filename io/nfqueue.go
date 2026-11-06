@@ -146,6 +146,7 @@ type nftCtx struct {
 	offloadAllow     *nftables.Set
 	offloadDrop      *nftables.Set
 	convergenceAllow *nftables.Set // nil if convergence disabled
+	convergenceDrop  *nftables.Set // nil if convergence disabled
 }
 
 // makeConcatKey builds a concatenated key for ipv4_addr . inet_service sets.
@@ -157,54 +158,82 @@ func makeConcatKey(ip net.IP, port uint16) []byte {
 	return key
 }
 
+// makeIPElemList builds a list of set elements for an ipv4_addr set.
+func makeIPElemList(ips []net.IP, timeout time.Duration) []nftables.SetElement {
+	elems := make([]nftables.SetElement, 0, len(ips))
+	for _, ip := range ips {
+		elems = append(elems, nftables.SetElement{
+			Key:     ip.To4(),
+			Timeout: timeout,
+		})
+	}
+	return elems
+}
+
 type convergenceEntry struct {
 	ports     map[uint16]struct{}
 	firstSeen time.Time
 }
 
 type convergenceMap struct {
-	mu      sync.Mutex
-	entries map[[4]byte]*convergenceEntry
+	mu sync.Mutex
+	// allow and drop are tracked separately so that blocked endpoints can
+	// never be promoted into the allow set.
+	allow map[[4]byte]*convergenceEntry
+	drop  map[[4]byte]*convergenceEntry
 }
 
 func newConvergenceMap() *convergenceMap {
 	return &convergenceMap{
-		entries: make(map[[4]byte]*convergenceEntry),
+		allow: make(map[[4]byte]*convergenceEntry),
+		drop:  make(map[[4]byte]*convergenceEntry),
 	}
 }
 
-func (m *convergenceMap) add(ip [4]byte, port uint16) {
+func (m *convergenceMap) add(ip [4]byte, port uint16, allow bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entry, exists := m.entries[ip]
+	entries := m.drop
+	if allow {
+		entries = m.allow
+	}
+	entry, exists := entries[ip]
 	if !exists {
 		entry = &convergenceEntry{
 			ports:     make(map[uint16]struct{}),
 			firstSeen: time.Now(),
 		}
-		m.entries[ip] = entry
+		entries[ip] = entry
 	}
 	entry.ports[port] = struct{}{}
 }
 
-func (m *convergenceMap) checkAndPromote(threshold int, maxAge time.Duration) []net.IP {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// promoteEntries promotes IPs whose distinct port count reaches threshold and
+// removes expired entries.
+func promoteEntries(entries map[[4]byte]*convergenceEntry, threshold int, maxAge time.Duration) []net.IP {
 	now := time.Now()
 	var result []net.IP
-	for ip, entry := range m.entries {
+	for ip, entry := range entries {
 		if now.Sub(entry.firstSeen) > maxAge {
-			delete(m.entries, ip)
+			delete(entries, ip)
 			continue
 		}
 		if len(entry.ports) >= threshold {
 			ipCopy := make(net.IP, 4)
 			copy(ipCopy, ip[:])
 			result = append(result, ipCopy)
-			delete(m.entries, ip)
+			delete(entries, ip)
 		}
 	}
 	return result
+}
+
+func (m *convergenceMap) checkAndPromote(threshold int, maxAge time.Duration) (allowIPs, dropIPs []net.IP) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	allowIPs = promoteEntries(m.allow, threshold, maxAge)
+	dropIPs = promoteEntries(m.drop, threshold, maxAge)
+	return allowIPs, dropIPs
 }
 
 func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
@@ -237,6 +266,11 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, 
 			Type:    "ipv4_addr",
 			Timeout: ttl,
 		})
+		table.Sets = append(table.Sets, nftSetSpec{
+			Name:    "convergence_drop",
+			Type:    "ipv4_addr",
+			Timeout: ttl,
+		})
 	}
 	if local {
 		table.Chains = []nftChainSpec{
@@ -251,9 +285,18 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, 
 	for i := range table.Chains {
 		c := &table.Chains[i]
 		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK")
+		// Let traffic from OpenGFW's own protected sockets bypass even the
+		// convergence drop set.
+		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK counter accept")
+		if convergenceEnabled {
+			// Drop rules are placed before both the connmark accept and the
+			// allow sets so that an IP promoted to convergence_drop always
+			// wins over a previously accepted connection or an allow entry.
+			c.Rules = append(c.Rules, convergenceDropRules(protos, rst)...)
+		}
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
 		if convergenceEnabled {
-			c.Rules = append(c.Rules, convergenceLookupRules()...)
+			c.Rules = append(c.Rules, convergenceAllowRules()...)
 		}
 		if offloadEnabled {
 			c.Rules = append(c.Rules, offloadLookupRules(protos, rst)...)
@@ -289,10 +332,28 @@ func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
 	return rules
 }
 
-func convergenceLookupRules() []string {
+func convergenceAllowRules() []string {
+	return []string{
+		"ip saddr @convergence_allow accept",
+		"ip daddr @convergence_allow accept",
+	}
+}
+
+// convergenceDropRules drops (or resets, for TCP) all traffic from/to an IP
+// that has been promoted to the convergence drop set. TCP RST rules come
+// first so they take precedence over the catch-all drop rules.
+func convergenceDropRules(protos nfProtocolConfig, rst bool) []string {
 	var rules []string
-	rules = append(rules, "ip saddr @convergence_allow accept")
-	rules = append(rules, "ip daddr @convergence_allow accept")
+	if rst && protos.TCP {
+		rules = append(rules,
+			"ip protocol tcp ip saddr @convergence_drop counter reject with tcp reset",
+			"ip protocol tcp ip daddr @convergence_drop counter reject with tcp reset",
+		)
+	}
+	rules = append(rules,
+		"ip saddr @convergence_drop counter drop",
+		"ip daddr @convergence_drop counter drop",
+	)
 	return rules
 }
 
@@ -605,9 +666,10 @@ func (n *nfqueuePacketIO) initNft() error {
 	if err != nil {
 		return fmt.Errorf("get offload_drop set: %w", err)
 	}
-	var convergenceAllow *nftables.Set
+	var convergenceAllow, convergenceDrop *nftables.Set
 	if n.offloadConvergence > 0 {
 		convergenceAllow, _ = conn.GetSetByName(table, "convergence_allow")
+		convergenceDrop, _ = conn.GetSetByName(table, "convergence_drop")
 	}
 
 	n.nftCtx = &nftCtx{
@@ -616,6 +678,7 @@ func (n *nfqueuePacketIO) initNft() error {
 		offloadAllow:     offloadAllow,
 		offloadDrop:      offloadDrop,
 		convergenceAllow: convergenceAllow,
+		convergenceDrop:  convergenceDrop,
 	}
 	return nil
 }
@@ -1074,7 +1137,7 @@ func (n *nfqueuePacketIO) offloadWorker() {
 		if n.convergenceMap != nil {
 			var ip [4]byte
 			copy(ip[:], e.ip.To4())
-			n.convergenceMap.add(ip, e.port)
+			n.convergenceMap.add(ip, e.port, e.allow)
 		}
 	}
 
@@ -1105,16 +1168,16 @@ func (n *nfqueuePacketIO) offloadWorker() {
 			}
 
 			if n.convergenceMap != nil {
-				ips := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
-				if len(ips) > 0 && n.nftCtx.convergenceAllow != nil {
-					elems := make([]nftables.SetElement, 0, len(ips))
-					for _, ip := range ips {
-						elems = append(elems, nftables.SetElement{
-							Key:     ip.To4(),
-							Timeout: n.offloadConvergenceTTL,
-						})
-					}
-					_ = n.nftCtx.conn.SetAddElements(n.nftCtx.convergenceAllow, elems)
+				allowIPs, dropIPs := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
+				addAllow := len(allowIPs) > 0 && n.nftCtx.convergenceAllow != nil
+				addDrop := len(dropIPs) > 0 && n.nftCtx.convergenceDrop != nil
+				if addAllow {
+					_ = n.nftCtx.conn.SetAddElements(n.nftCtx.convergenceAllow, makeIPElemList(allowIPs, n.offloadConvergenceTTL))
+				}
+				if addDrop {
+					_ = n.nftCtx.conn.SetAddElements(n.nftCtx.convergenceDrop, makeIPElemList(dropIPs, n.offloadConvergenceTTL))
+				}
+				if addAllow || addDrop {
 					_ = n.nftCtx.conn.Flush()
 				}
 			}
