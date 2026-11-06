@@ -1,42 +1,54 @@
 name: Release
+
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version/tag, e.g. v1.0.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
-  releases-matrix:
-    name: Release Go Binary
+  release:
+    name: Build and Release
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux]
-        goarch: ["386", amd64, arm64]
-
+    env:
+      GOOS: linux
+      CGO_ENABLED: 0
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
 
-      - name: Clean Go cache
-        run: go clean -cache
+      - name: Download dependencies
+        run: go mod download
 
-      - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+      - name: Build linux binaries
         run: |
-          mkdir -p build
-          go build -o build/OpenGFW-${GOOS}-${GOARCH} -ldflags "-s -w" .
+          mkdir -p build_assets
+          for arch in 386 amd64 arm64; do
+            echo "Building linux/$arch"
+            GOARCH="$arch" go build -v \
+              -trimpath \
+              -ldflags "-s -w -buildid=" \
+              -o "build_assets/OpenGFW-linux-$arch" \
+              .
+            ls -lh "build_assets/OpenGFW-linux-$arch"
+            file "build_assets/OpenGFW-linux-$arch"
+          done
 
-      - name: Upload
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: build_assets/*
