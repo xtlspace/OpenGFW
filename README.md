@@ -47,10 +47,12 @@ OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wiki
 - 修复 UDP 流内存泄漏：LRU 淘汰时释放对应 analyzer 资源
 - Go 版本升级至 1.26（`go.mod` 与 Release 构建同步）
 - 启用 PGO（Profile-Guided Optimization）：新增规则匹配基准测试 `BenchmarkMatch`，基于其 profile 生成 `default.pgo`，构建时自动生效
-- 新增 nftables 连接卸载（offload）功能：同一 dst+dport 达到指定次数后自动添加带 TTL 的 nftables 集合元素，后续连接内核直达不再进用户态分析；TTL 到期后重新采样
+- 新增 nftables 连接卸载（offload）功能：出站按 `远端IP:远端端口`、入站按 `客户端IP:服务端口` 统计，达到阈值后添加带 TTL 的 nftables 集合元素，后续连接内核直达不再进用户态分析；TTL 到期后重新采样
+  - 方向按 conntrack 原始方向归一化，响应包不会生成错误的出站条目
   - 配置项：`offload`（开关）、`offloadTtl`（过期时间，默认 60s）、`offloadThreshold`（触发阈值，默认 3）
+  - 入站/出站分别使用 `offload_in_allow`、`offload_in_drop`、`offload_out_allow`、`offload_out_drop` 四个集合，避免 key 语义交叉
 - 新增 NFQueue 多队列 fanout：`queue num 100-N` 按 flow hash 分发到多个队列，每个队列独立读取，突破单读线程上限
   - 配置项：`queues`（队列数量，默认 `min(NumCPU, 8)`，设为 1 可关闭）
 - verdict 批量回写：每个队列使用独立 netlink 发送协程，通过单次 `sendmsg` 批量提交多个 verdict，减少系统调用
-- offload convergence 区分 allow/drop：新增 `convergence_drop` 集合，阻断型 IP 不会再被错误提升到 `convergence_allow`；convergence_drop 规则优先于 connmark 放行、convergence_allow 和 offload
+- offload convergence 只提升 drop：同一 IP 多个端口被阻断达到阈值后加入 `convergence_drop` 并整 IP 封禁；不再生成 `convergence_allow`，避免整 IP 绕过检测
 - 规则匹配与每包路径优化：复用 expr 环境/VM、缓存流地址字符串、sharded offload 计数、批量 nftables 写入、零分配 conntrack ID 解析、日志惰性求值等

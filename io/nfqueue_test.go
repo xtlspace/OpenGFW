@@ -2,6 +2,7 @@ package io
 
 import (
 	"encoding/binary"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -67,8 +68,11 @@ func TestConvergenceRulesAndSets(t *testing.T) {
 	for _, s := range table.Sets {
 		sets[s.Name] = true
 	}
-	if !sets["convergence_allow"] || !sets["convergence_drop"] {
-		t.Fatalf("missing convergence sets: %v", sets)
+	if !sets["convergence_drop"] {
+		t.Fatalf("missing convergence_drop set: %v", sets)
+	}
+	if sets["convergence_allow"] {
+		t.Fatalf("convergence_allow must not exist: %v", sets)
 	}
 
 	rules := table.Chains[0].Rules
@@ -83,17 +87,16 @@ func TestConvergenceRulesAndSets(t *testing.T) {
 	drop := indexOf("@convergence_drop")
 	protected := indexOf("meta mark $ACCEPT_CTMARK counter accept")
 	ctAccept := indexOf("ct mark $ACCEPT_CTMARK counter accept")
-	allow := indexOf("@convergence_allow")
-	offload := indexOf("@offload_allow")
+	offload := indexOf("@offload_in_drop")
 	queue := indexOf("queue num")
-	if drop < 0 || protected < 0 || ctAccept < 0 || allow < 0 || offload < 0 || queue < 0 {
+	if drop < 0 || protected < 0 || ctAccept < 0 || offload < 0 || queue < 0 {
 		t.Fatalf("missing expected rules: %v", rules)
 	}
-	// Protected sockets bypass even convergence_drop; drop still wins over
-	// connmark accept, convergence allow and offload.
-	if !(protected < drop && drop < ctAccept && ctAccept < allow && allow < offload && offload < queue) {
-		t.Fatalf("unexpected rule order: protected=%d drop=%d ctAccept=%d allow=%d offload=%d queue=%d\n%v",
-			protected, drop, ctAccept, allow, offload, queue, rules)
+	// Protected sockets bypass even convergence_drop; drop wins over
+	// connmark accept and offload.
+	if !(protected < drop && drop < ctAccept && ctAccept < offload && offload < queue) {
+		t.Fatalf("unexpected rule order: protected=%d drop=%d ctAccept=%d offload=%d queue=%d\n%v",
+			protected, drop, ctAccept, offload, queue, rules)
 	}
 
 	// TCP reset rules must come before the generic convergence_drop rules.
@@ -121,31 +124,128 @@ func TestConvergenceDisabledHasNoConvergenceSets(t *testing.T) {
 	}
 }
 
-func TestConvergenceMapSeparatesAllowAndDrop(t *testing.T) {
+func TestConvergenceMapDropOnly(t *testing.T) {
 	ip := [4]byte{192, 0, 2, 1}
 	m := newConvergenceMap()
 
 	// Duplicate ports count only once.
-	m.add(ip, 80, true)
-	m.add(ip, 80, true)
-	if allow, drop := m.checkAndPromote(2, time.Hour); len(allow) != 0 || len(drop) != 0 {
-		t.Fatalf("unexpected early promotion: allow=%v drop=%v", allow, drop)
+	m.add(ip, 80)
+	m.add(ip, 80)
+	if drop := m.checkAndPromote(2, time.Hour); len(drop) != 0 {
+		t.Fatalf("unexpected early promotion: %v", drop)
 	}
 
-	m.add(ip, 443, true)
-	allow, drop := m.checkAndPromote(2, time.Hour)
-	if len(allow) != 1 || len(drop) != 0 {
-		t.Fatalf("expected allow-only promotion, got allow=%v drop=%v", allow, drop)
+	m.add(ip, 443)
+	drop := m.checkAndPromote(2, time.Hour)
+	if len(drop) != 1 {
+		t.Fatalf("expected drop promotion, got %v", drop)
+	}
+}
+
+func TestOffloadKeyFor(t *testing.T) {
+	cidr := &net.IPNet{IP: net.IPv4(172, 16, 233, 0).To4(), Mask: net.CIDRMask(24, 32)}
+	inboundClient := [4]byte{203, 0, 113, 5}
+	container := [4]byte{172, 16, 233, 10}
+
+	// Inbound request: client -> container.
+	key, ok := offloadKeyFor(inboundClient, container, 50000, 443, false, cidr)
+	if !ok || !key.inbound || key.ip != inboundClient || key.port != 443 {
+		t.Fatalf("unexpected inbound key: %+v ok=%v", key, ok)
+	}
+	// Inbound response must normalize to the same key.
+	key, ok = offloadKeyFor(container, inboundClient, 443, 50000, true, cidr)
+	if !ok || !key.inbound || key.ip != inboundClient || key.port != 443 {
+		t.Fatalf("unexpected inbound reply key: %+v ok=%v", key, ok)
 	}
 
-	m.add(ip, 8080, false)
-	if allow, drop = m.checkAndPromote(2, time.Hour); len(allow) != 0 || len(drop) != 0 {
-		t.Fatalf("unexpected early drop promotion: allow=%v drop=%v", allow, drop)
+	// Outbound request: container -> remote.
+	remote := [4]byte{198, 51, 100, 7}
+	key, ok = offloadKeyFor(container, remote, 40000, 853, false, cidr)
+	if !ok || key.inbound || key.ip != remote || key.port != 853 {
+		t.Fatalf("unexpected outbound key: %+v ok=%v", key, ok)
 	}
-	m.add(ip, 8443, false)
-	allow, drop = m.checkAndPromote(2, time.Hour)
-	if len(allow) != 0 || len(drop) != 1 {
-		t.Fatalf("expected drop-only promotion, got allow=%v drop=%v", allow, drop)
+	// Outbound response must normalize to the same key.
+	key, ok = offloadKeyFor(remote, container, 853, 40000, true, cidr)
+	if !ok || key.inbound || key.ip != remote || key.port != 853 {
+		t.Fatalf("unexpected outbound reply key: %+v ok=%v", key, ok)
+	}
+
+	if _, ok := offloadKeyFor([4]byte{1, 1, 1, 1}, [4]byte{8, 8, 8, 8}, 40000, 443, false, cidr); ok {
+		t.Fatal("expected unrelated traffic to be ignored")
+	}
+}
+
+func TestOffloadCounterVerdictChangeResets(t *testing.T) {
+	c := newOffloadCounter()
+	key := offloadKey{ip: [4]byte{192, 0, 2, 1}, port: 443, inbound: true}
+
+	if c.increment(key, true, 2) {
+		t.Fatal("unexpected promotion on first allow")
+	}
+	// Verdict changed to drop: the allow streak must not count towards it.
+	if c.increment(key, false, 2) {
+		t.Fatal("unexpected promotion after verdict change")
+	}
+	if !c.increment(key, false, 2) {
+		t.Fatal("expected promotion after two consistent drop verdicts")
+	}
+}
+
+func TestOffloadCounterThresholdOne(t *testing.T) {
+	c := newOffloadCounter()
+	key := offloadKey{ip: [4]byte{192, 0, 2, 2}, port: 80}
+	if !c.increment(key, true, 1) {
+		t.Fatal("threshold 1 should promote on the first verdict")
+	}
+}
+
+func TestOffloadRulesAndSets(t *testing.T) {
+	table, err := generateNftRules(
+		false, true,
+		nfProtocolConfig{TCP: true, IPv4: true},
+		1, true, time.Minute,
+		false, time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sets := make(map[string]bool)
+	for _, s := range table.Sets {
+		sets[s.Name] = true
+	}
+	for _, name := range []string{
+		"offload_in_allow", "offload_in_drop",
+		"offload_out_allow", "offload_out_drop",
+	} {
+		if !sets[name] {
+			t.Fatalf("missing set %s: %v", name, sets)
+		}
+	}
+	if sets["offload_allow"] || sets["offload_drop"] {
+		t.Fatalf("unexpected legacy offload sets: %v", sets)
+	}
+
+	rules := table.Chains[0].Rules
+	indexOf := func(sub string) int {
+		for i, r := range rules {
+			if strings.Contains(r, sub) {
+				return i
+			}
+		}
+		return -1
+	}
+	inDrop := indexOf("ip saddr . tcp dport @offload_in_drop")
+	inDropRev := indexOf("ip daddr . tcp sport @offload_in_drop")
+	inAllow := indexOf("ip saddr . tcp dport @offload_in_allow")
+	inAllowRev := indexOf("ip daddr . tcp sport @offload_in_allow")
+	outDrop := indexOf("ip daddr . tcp dport @offload_out_drop")
+	outAllow := indexOf("ip daddr . tcp dport @offload_out_allow")
+	if inDrop < 0 || inDropRev < 0 || inAllow < 0 || inAllowRev < 0 || outDrop < 0 || outAllow < 0 {
+		t.Fatalf("missing offload rules: %v", rules)
+	}
+	// Drop must be checked before allow within the same direction.
+	if !(inDrop < inAllow && inDropRev < inAllowRev && outDrop < outAllow) {
+		t.Fatalf("unexpected offload rule order: %v", rules)
 	}
 }
 

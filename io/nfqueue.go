@@ -48,11 +48,16 @@ const (
 	maxVerdictBatch      = 64
 	maxVerdictBatchBytes = 32 * 1024
 	verdictChanBuffer    = 1024
+
+	// ipCtIsReply is set in NFQA_CT_INFO for packets in the reply direction
+	// of their conntrack entry.
+	ipCtIsReply = 0x80
 )
 
 type offloadKey struct {
-	ip   [4]byte
-	port uint16
+	ip      [4]byte
+	port    uint16
+	inbound bool
 }
 
 type offloadCounterEntry struct {
@@ -89,6 +94,10 @@ func (k offloadKey) shard() uint32 {
 	}
 	h ^= uint32(k.port)
 	h *= 16777619
+	if k.inbound {
+		h ^= 1
+		h *= 16777619
+	}
 	return h % offloadCounterShardCount
 }
 
@@ -99,17 +108,16 @@ func (c *offloadCounter) increment(key offloadKey, allow bool, threshold int) bo
 	defer shard.mu.Unlock()
 	entry, exists := shard.counts[key]
 	if !exists {
-		shard.counts[key] = &offloadCounterEntry{
-			count:    1,
-			allow:    allow,
-			lastSeen: now,
-		}
-		return false
+		entry = &offloadCounterEntry{allow: allow}
+		shard.counts[key] = entry
+	} else if entry.allow != allow {
+		// Verdict changed: require a fresh set of consistent verdicts.
+		entry.count = 0
+		entry.allow = allow
 	}
 	entry.count++
-	entry.allow = allow
 	entry.lastSeen = now
-	if entry.count >= threshold {
+	if threshold > 0 && entry.count >= threshold {
 		delete(shard.counts, key)
 		return true
 	}
@@ -134,6 +142,7 @@ type offloadEntry struct {
 	ip       net.IP
 	port     uint16
 	allow    bool
+	inbound  bool
 	ruleName string
 }
 
@@ -141,12 +150,13 @@ type offloadEntry struct {
 // for runtime element operations (offload hot path).
 // Uses transient mode (no AsLasting) to avoid stale netlink messages.
 type nftCtx struct {
-	conn             *nftables.Conn
-	table            *nftables.Table
-	offloadAllow     *nftables.Set
-	offloadDrop      *nftables.Set
-	convergenceAllow *nftables.Set // nil if convergence disabled
-	convergenceDrop  *nftables.Set // nil if convergence disabled
+	conn            *nftables.Conn
+	table           *nftables.Table
+	offloadInAllow  *nftables.Set
+	offloadInDrop   *nftables.Set
+	offloadOutAllow *nftables.Set
+	offloadOutDrop  *nftables.Set
+	convergenceDrop *nftables.Set // nil if convergence disabled
 }
 
 // makeConcatKey builds a concatenated key for ipv4_addr . inet_service sets.
@@ -177,33 +187,28 @@ type convergenceEntry struct {
 
 type convergenceMap struct {
 	mu sync.Mutex
-	// allow and drop are tracked separately so that blocked endpoints can
-	// never be promoted into the allow set.
-	allow map[[4]byte]*convergenceEntry
-	drop  map[[4]byte]*convergenceEntry
+	// Only drop verdicts are promoted. Promoting allow verdicts to a
+	// whole-IP allow set would bypass all inspection for that IP and is too
+	// easy to trigger with ordinary traffic.
+	drop map[[4]byte]*convergenceEntry
 }
 
 func newConvergenceMap() *convergenceMap {
 	return &convergenceMap{
-		allow: make(map[[4]byte]*convergenceEntry),
-		drop:  make(map[[4]byte]*convergenceEntry),
+		drop: make(map[[4]byte]*convergenceEntry),
 	}
 }
 
-func (m *convergenceMap) add(ip [4]byte, port uint16, allow bool) {
+func (m *convergenceMap) add(ip [4]byte, port uint16) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entries := m.drop
-	if allow {
-		entries = m.allow
-	}
-	entry, exists := entries[ip]
+	entry, exists := m.drop[ip]
 	if !exists {
 		entry = &convergenceEntry{
 			ports:     make(map[uint16]struct{}),
 			firstSeen: time.Now(),
 		}
-		entries[ip] = entry
+		m.drop[ip] = entry
 	}
 	entry.ports[port] = struct{}{}
 }
@@ -228,12 +233,10 @@ func promoteEntries(entries map[[4]byte]*convergenceEntry, threshold int, maxAge
 	return result
 }
 
-func (m *convergenceMap) checkAndPromote(threshold int, maxAge time.Duration) (allowIPs, dropIPs []net.IP) {
+func (m *convergenceMap) checkAndPromote(threshold int, maxAge time.Duration) []net.IP {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	allowIPs = promoteEntries(m.allow, threshold, maxAge)
-	dropIPs = promoteEntries(m.drop, threshold, maxAge)
-	return allowIPs, dropIPs
+	return promoteEntries(m.drop, threshold, maxAge)
 }
 
 func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, offloadEnabled bool, offloadTTL time.Duration, convergenceEnabled bool, convergenceTTL time.Duration) (*nftTableSpec, error) {
@@ -248,24 +251,19 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, 
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", nfqueueConnMarkDrop))
 	if offloadEnabled {
 		ttl := fmt.Sprintf("%ds", int(offloadTTL.Seconds()))
-		table.Sets = append(table.Sets, nftSetSpec{
-			Name:    "offload_allow",
-			Type:    "ipv4_addr . inet_service",
-			Timeout: ttl,
-		})
-		table.Sets = append(table.Sets, nftSetSpec{
-			Name:    "offload_drop",
-			Type:    "ipv4_addr . inet_service",
-			Timeout: ttl,
-		})
+		for _, name := range []string{
+			"offload_in_allow", "offload_in_drop",
+			"offload_out_allow", "offload_out_drop",
+		} {
+			table.Sets = append(table.Sets, nftSetSpec{
+				Name:    name,
+				Type:    "ipv4_addr . inet_service",
+				Timeout: ttl,
+			})
+		}
 	}
 	if convergenceEnabled {
 		ttl := fmt.Sprintf("%ds", int(convergenceTTL.Seconds()))
-		table.Sets = append(table.Sets, nftSetSpec{
-			Name:    "convergence_allow",
-			Type:    "ipv4_addr",
-			Timeout: ttl,
-		})
 		table.Sets = append(table.Sets, nftSetSpec{
 			Name:    "convergence_drop",
 			Type:    "ipv4_addr",
@@ -295,9 +293,6 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, 
 			c.Rules = append(c.Rules, convergenceDropRules(protos, rst)...)
 		}
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
-		if convergenceEnabled {
-			c.Rules = append(c.Rules, convergenceAllowRules()...)
-		}
 		if offloadEnabled {
 			c.Rules = append(c.Rules, offloadLookupRules(protos, rst)...)
 		}
@@ -313,30 +308,51 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, 
 func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
 	var rules []string
 	if protos.TCP {
-		rules = append(rules, "ip daddr . tcp dport @offload_allow accept")
-		rules = append(rules, "ip saddr . tcp sport @offload_allow accept")
+		// Drop rules first: a key present in both sets must fail closed.
 		if rst {
-			rules = append(rules, "ip daddr . tcp dport @offload_drop counter reject with tcp reset")
-			rules = append(rules, "ip saddr . tcp sport @offload_drop counter reject with tcp reset")
+			rules = append(rules,
+				"ip saddr . tcp dport @offload_in_drop counter reject with tcp reset",
+				"ip daddr . tcp sport @offload_in_drop counter reject with tcp reset",
+			)
 		} else {
-			rules = append(rules, "ip daddr . tcp dport @offload_drop counter drop")
-			rules = append(rules, "ip saddr . tcp sport @offload_drop counter drop")
+			rules = append(rules,
+				"ip saddr . tcp dport @offload_in_drop counter drop",
+				"ip daddr . tcp sport @offload_in_drop counter drop",
+			)
 		}
+		rules = append(rules,
+			"ip saddr . tcp dport @offload_in_allow accept",
+			"ip daddr . tcp sport @offload_in_allow accept",
+		)
+		if rst {
+			rules = append(rules,
+				"ip daddr . tcp dport @offload_out_drop counter reject with tcp reset",
+				"ip saddr . tcp sport @offload_out_drop counter reject with tcp reset",
+			)
+		} else {
+			rules = append(rules,
+				"ip daddr . tcp dport @offload_out_drop counter drop",
+				"ip saddr . tcp sport @offload_out_drop counter drop",
+			)
+		}
+		rules = append(rules,
+			"ip daddr . tcp dport @offload_out_allow accept",
+			"ip saddr . tcp sport @offload_out_allow accept",
+		)
 	}
 	if protos.UDP {
-		rules = append(rules, "ip daddr . udp dport @offload_allow accept")
-		rules = append(rules, "ip saddr . udp sport @offload_allow accept")
-		rules = append(rules, "ip daddr . udp dport @offload_drop counter drop")
-		rules = append(rules, "ip saddr . udp sport @offload_drop counter drop")
+		rules = append(rules,
+			"ip saddr . udp dport @offload_in_drop counter drop",
+			"ip daddr . udp sport @offload_in_drop counter drop",
+			"ip saddr . udp dport @offload_in_allow accept",
+			"ip daddr . udp sport @offload_in_allow accept",
+			"ip daddr . udp dport @offload_out_drop counter drop",
+			"ip saddr . udp sport @offload_out_drop counter drop",
+			"ip daddr . udp dport @offload_out_allow accept",
+			"ip saddr . udp sport @offload_out_allow accept",
+		)
 	}
 	return rules
-}
-
-func convergenceAllowRules() []string {
-	return []string{
-		"ip saddr @convergence_allow accept",
-		"ip daddr @convergence_allow accept",
-	}
 }
 
 // convergenceDropRules drops (or resets, for TCP) all traffic from/to an IP
@@ -658,27 +674,35 @@ func (n *nfqueuePacketIO) initNft() error {
 
 	table := &nftables.Table{Family: nftables.TableFamilyINet, Name: nftTable}
 
-	offloadAllow, err := conn.GetSetByName(table, "offload_allow")
+	offloadInAllow, err := conn.GetSetByName(table, "offload_in_allow")
 	if err != nil {
-		return fmt.Errorf("get offload_allow set: %w", err)
+		return fmt.Errorf("get offload_in_allow set: %w", err)
 	}
-	offloadDrop, err := conn.GetSetByName(table, "offload_drop")
+	offloadInDrop, err := conn.GetSetByName(table, "offload_in_drop")
 	if err != nil {
-		return fmt.Errorf("get offload_drop set: %w", err)
+		return fmt.Errorf("get offload_in_drop set: %w", err)
 	}
-	var convergenceAllow, convergenceDrop *nftables.Set
+	offloadOutAllow, err := conn.GetSetByName(table, "offload_out_allow")
+	if err != nil {
+		return fmt.Errorf("get offload_out_allow set: %w", err)
+	}
+	offloadOutDrop, err := conn.GetSetByName(table, "offload_out_drop")
+	if err != nil {
+		return fmt.Errorf("get offload_out_drop set: %w", err)
+	}
+	var convergenceDrop *nftables.Set
 	if n.offloadConvergence > 0 {
-		convergenceAllow, _ = conn.GetSetByName(table, "convergence_allow")
 		convergenceDrop, _ = conn.GetSetByName(table, "convergence_drop")
 	}
 
 	n.nftCtx = &nftCtx{
-		conn:             conn,
-		table:            table,
-		offloadAllow:     offloadAllow,
-		offloadDrop:      offloadDrop,
-		convergenceAllow: convergenceAllow,
-		convergenceDrop:  convergenceDrop,
+		conn:            conn,
+		table:           table,
+		offloadInAllow:  offloadInAllow,
+		offloadInDrop:   offloadInDrop,
+		offloadOutAllow: offloadOutAllow,
+		offloadOutDrop:  offloadOutDrop,
+		convergenceDrop: convergenceDrop,
 	}
 	return nil
 }
@@ -699,6 +723,10 @@ func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error
 					streamID: ctIDFromCtBytes(*a.Ct),
 					data:     *a.Payload,
 					queue:    q,
+				}
+				if a.CtInfo != nil {
+					p.ctInfo = *a.CtInfo
+					p.hasCt = true
 				}
 				return okBoolToInt(cb(p, nil))
 			},
@@ -771,7 +799,7 @@ func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte, rule
 		q.enqueue(verdictRequest{id: nP.id, verdict: nfqueue.NfAccept, payload: payload})
 	case VerdictAcceptStream:
 		if n.offloadEnabled {
-			n.checkOffload(nP.data, true, ruleName)
+			n.checkOffload(nP, true, ruleName)
 		}
 		q.enqueue(verdictRequest{
 			id:      nP.id,
@@ -783,7 +811,7 @@ func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte, rule
 		q.enqueue(verdictRequest{id: nP.id, verdict: nfqueue.NfDrop})
 	case VerdictDropStream:
 		if n.offloadEnabled {
-			n.checkOffload(nP.data, false, ruleName)
+			n.checkOffload(nP, false, ruleName)
 		}
 		q.enqueue(verdictRequest{
 			id:      nP.id,
@@ -862,6 +890,18 @@ type nfqueuePacket struct {
 	streamID uint32
 	data     []byte
 	queue    *nfqueueQueue
+	ctInfo   uint32
+	hasCt    bool
+}
+
+// reply reports whether the packet is in the reply direction of its
+// conntrack entry. NFQA_CT_INFO may be delivered in native or network byte
+// order depending on the kernel, so accept either position of the reply bit.
+func (p *nfqueuePacket) reply() bool {
+	if !p.hasCt {
+		return false
+	}
+	return p.ctInfo&ipCtIsReply != 0 || p.ctInfo&(ipCtIsReply<<24) != 0
 }
 
 func (p *nfqueuePacket) StreamID() uint32 {
@@ -1072,7 +1112,27 @@ func ctIDFromCtBytes(ct []byte) uint32 {
 	return 0
 }
 
-func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool, ruleName string) {
+// offloadKeyFor returns the stable offload key for a packet. Inbound keys use
+// the client IP and the destination service port; outbound keys use the remote
+// IP and remote port. The key is normalized to the original (request)
+// direction first, so reply packets do not create bogus outbound entries with
+// ephemeral client ports.
+func offloadKeyFor(srcIP, dstIP [4]byte, srcPort, dstPort uint16, reply bool, cidr *net.IPNet) (offloadKey, bool) {
+	if reply {
+		srcIP, dstIP = dstIP, srcIP
+		srcPort, dstPort = dstPort, srcPort
+	}
+	if cidr.Contains(net.IP(dstIP[:])) {
+		return offloadKey{ip: srcIP, port: dstPort, inbound: true}, true
+	}
+	if cidr.Contains(net.IP(srcIP[:])) {
+		return offloadKey{ip: dstIP, port: dstPort, inbound: false}, true
+	}
+	return offloadKey{}, false
+}
+
+func (n *nfqueuePacketIO) checkOffload(p *nfqueuePacket, allow bool, ruleName string) {
+	data := p.data
 	if len(data) < 20 {
 		return
 	}
@@ -1094,20 +1154,20 @@ func (n *nfqueuePacketIO) checkOffload(data []byte, allow bool, ruleName string)
 	srcPort := binary.BigEndian.Uint16(data[ipHdrLen : ipHdrLen+2])
 	dstPort := binary.BigEndian.Uint16(data[ipHdrLen+2 : ipHdrLen+4])
 
-	var key offloadKey
-	if n.offloadCIDR.Contains(net.IP(dstIP[:])) {
-		// dst ∈ CIDR (inbound) → record src+sport
-		key = offloadKey{ip: srcIP, port: srcPort}
-	} else if n.offloadCIDR.Contains(net.IP(srcIP[:])) {
-		// src ∈ CIDR (outbound) → record dst+dport
-		key = offloadKey{ip: dstIP, port: dstPort}
-	} else {
+	key, ok := offloadKeyFor(srcIP, dstIP, srcPort, dstPort, p.reply(), n.offloadCIDR)
+	if !ok {
 		return
 	}
 
 	if n.offloadCounter.increment(key, allow, n.offloadThreshold) {
 		select {
-		case n.offloadCh <- offloadEntry{ip: net.IP(key.ip[:]), port: key.port, allow: allow, ruleName: ruleName}:
+		case n.offloadCh <- offloadEntry{
+			ip:       net.IP(key.ip[:]),
+			port:     key.port,
+			allow:    allow,
+			inbound:  key.inbound,
+			ruleName: ruleName,
+		}:
 		default:
 		}
 	}
@@ -1118,13 +1178,22 @@ func (n *nfqueuePacketIO) offloadWorker() {
 	// a single nftables flush. Batching avoids opening/closing a netlink
 	// socket for every offloaded stream.
 	const maxOffloadBatch = 256
-	allowElems := make([]nftables.SetElement, 0, maxOffloadBatch)
-	dropElems := make([]nftables.SetElement, 0, maxOffloadBatch)
+	inAllow := make([]nftables.SetElement, 0, maxOffloadBatch)
+	inDrop := make([]nftables.SetElement, 0, maxOffloadBatch)
+	outAllow := make([]nftables.SetElement, 0, maxOffloadBatch)
+	outDrop := make([]nftables.SetElement, 0, maxOffloadBatch)
 
 	appendElement := func(e offloadEntry) {
-		set := &allowElems
-		if !e.allow {
-			set = &dropElems
+		var list *[]nftables.SetElement
+		switch {
+		case e.inbound && e.allow:
+			list = &inAllow
+		case e.inbound:
+			list = &inDrop
+		case e.allow:
+			list = &outAllow
+		default:
+			list = &outDrop
 		}
 		elem := nftables.SetElement{
 			Key:     makeConcatKey(e.ip, e.port),
@@ -1133,22 +1202,24 @@ func (n *nfqueuePacketIO) offloadWorker() {
 		if e.ruleName != "" {
 			elem.Comment = e.ruleName
 		}
-		*set = append(*set, elem)
-		if n.convergenceMap != nil {
+		*list = append(*list, elem)
+		if !e.allow && n.convergenceMap != nil {
 			var ip [4]byte
 			copy(ip[:], e.ip.To4())
-			n.convergenceMap.add(ip, e.port, e.allow)
+			n.convergenceMap.add(ip, e.port)
 		}
 	}
 
 	for {
 		select {
 		case e := <-n.offloadCh:
-			allowElems = allowElems[:0]
-			dropElems = dropElems[:0]
+			inAllow = inAllow[:0]
+			inDrop = inDrop[:0]
+			outAllow = outAllow[:0]
+			outDrop = outDrop[:0]
 			appendElement(e)
 		drain:
-			for len(allowElems)+len(dropElems) < maxOffloadBatch {
+			for len(inAllow)+len(inDrop)+len(outAllow)+len(outDrop) < maxOffloadBatch {
 				select {
 				case e2 := <-n.offloadCh:
 					appendElement(e2)
@@ -1157,27 +1228,26 @@ func (n *nfqueuePacketIO) offloadWorker() {
 				}
 			}
 
-			if len(allowElems) > 0 {
-				_ = n.nftCtx.conn.SetAddElements(n.nftCtx.offloadAllow, allowElems)
+			added := false
+			add := func(set *nftables.Set, elems []nftables.SetElement) {
+				if len(elems) == 0 || set == nil {
+					return
+				}
+				_ = n.nftCtx.conn.SetAddElements(set, elems)
+				added = true
 			}
-			if len(dropElems) > 0 {
-				_ = n.nftCtx.conn.SetAddElements(n.nftCtx.offloadDrop, dropElems)
-			}
-			if len(allowElems) > 0 || len(dropElems) > 0 {
+			add(n.nftCtx.offloadInAllow, inAllow)
+			add(n.nftCtx.offloadInDrop, inDrop)
+			add(n.nftCtx.offloadOutAllow, outAllow)
+			add(n.nftCtx.offloadOutDrop, outDrop)
+			if added {
 				_ = n.nftCtx.conn.Flush()
 			}
 
 			if n.convergenceMap != nil {
-				allowIPs, dropIPs := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
-				addAllow := len(allowIPs) > 0 && n.nftCtx.convergenceAllow != nil
-				addDrop := len(dropIPs) > 0 && n.nftCtx.convergenceDrop != nil
-				if addAllow {
-					_ = n.nftCtx.conn.SetAddElements(n.nftCtx.convergenceAllow, makeIPElemList(allowIPs, n.offloadConvergenceTTL))
-				}
-				if addDrop {
+				dropIPs := n.convergenceMap.checkAndPromote(n.offloadConvergence, n.offloadTTL)
+				if len(dropIPs) > 0 && n.nftCtx.convergenceDrop != nil {
 					_ = n.nftCtx.conn.SetAddElements(n.nftCtx.convergenceDrop, makeIPElemList(dropIPs, n.offloadConvergenceTTL))
-				}
-				if addAllow || addDrop {
 					_ = n.nftCtx.conn.Flush()
 				}
 			}
