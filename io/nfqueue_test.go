@@ -149,24 +149,24 @@ func TestOffloadKeyFor(t *testing.T) {
 
 	// Inbound request: client -> container.
 	key, ok := offloadKeyFor(inboundClient, container, 50000, 443, false, cidr)
-	if !ok || !key.inbound || key.ip != inboundClient || key.port != 443 {
+	if !ok || !key.inbound || key.ip != inboundClient || key.dstIP != container || key.port != 443 {
 		t.Fatalf("unexpected inbound key: %+v ok=%v", key, ok)
 	}
 	// Inbound response must normalize to the same key.
 	key, ok = offloadKeyFor(container, inboundClient, 443, 50000, true, cidr)
-	if !ok || !key.inbound || key.ip != inboundClient || key.port != 443 {
+	if !ok || !key.inbound || key.ip != inboundClient || key.dstIP != container || key.port != 443 {
 		t.Fatalf("unexpected inbound reply key: %+v ok=%v", key, ok)
 	}
 
 	// Outbound request: container -> remote.
 	remote := [4]byte{198, 51, 100, 7}
 	key, ok = offloadKeyFor(container, remote, 40000, 853, false, cidr)
-	if !ok || key.inbound || key.ip != remote || key.port != 853 {
+	if !ok || key.inbound || key.ip != remote || key.port != 853 || key.dstIP != ([4]byte{}) {
 		t.Fatalf("unexpected outbound key: %+v ok=%v", key, ok)
 	}
 	// Outbound response must normalize to the same key.
 	key, ok = offloadKeyFor(remote, container, 853, 40000, true, cidr)
-	if !ok || key.inbound || key.ip != remote || key.port != 853 {
+	if !ok || key.inbound || key.ip != remote || key.port != 853 || key.dstIP != ([4]byte{}) {
 		t.Fatalf("unexpected outbound reply key: %+v ok=%v", key, ok)
 	}
 
@@ -209,20 +209,19 @@ func TestOffloadRulesAndSets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sets := make(map[string]bool)
+	setTypes := make(map[string]string)
 	for _, s := range table.Sets {
-		sets[s.Name] = true
+		setTypes[s.Name] = s.Type
 	}
-	for _, name := range []string{
-		"offload_in_allow", "offload_in_drop",
-		"offload_out_allow", "offload_out_drop",
-	} {
-		if !sets[name] {
-			t.Fatalf("missing set %s: %v", name, sets)
+	for _, name := range []string{"offload_in_allow", "offload_in_drop"} {
+		if got := setTypes[name]; got != "ipv4_addr . ipv4_addr . inet_service" {
+			t.Fatalf("set %s type = %q", name, got)
 		}
 	}
-	if sets["offload_allow"] || sets["offload_drop"] {
-		t.Fatalf("unexpected legacy offload sets: %v", sets)
+	for _, name := range []string{"offload_out_allow", "offload_out_drop"} {
+		if got := setTypes[name]; got != "ipv4_addr . inet_service" {
+			t.Fatalf("set %s type = %q", name, got)
+		}
 	}
 
 	rules := table.Chains[0].Rules
@@ -234,10 +233,10 @@ func TestOffloadRulesAndSets(t *testing.T) {
 		}
 		return -1
 	}
-	inDrop := indexOf("ip saddr . tcp dport @offload_in_drop")
-	inDropRev := indexOf("ip daddr . tcp sport @offload_in_drop")
-	inAllow := indexOf("ip saddr . tcp dport @offload_in_allow")
-	inAllowRev := indexOf("ip daddr . tcp sport @offload_in_allow")
+	inDrop := indexOf("ip saddr . ip daddr . tcp dport @offload_in_drop")
+	inDropRev := indexOf("ip daddr . ip saddr . tcp sport @offload_in_drop")
+	inAllow := indexOf("ip saddr . ip daddr . tcp dport @offload_in_allow")
+	inAllowRev := indexOf("ip daddr . ip saddr . tcp sport @offload_in_allow")
 	outDrop := indexOf("ip daddr . tcp dport @offload_out_drop")
 	outAllow := indexOf("ip daddr . tcp dport @offload_out_allow")
 	if inDrop < 0 || inDropRev < 0 || inAllow < 0 || inAllowRev < 0 || outDrop < 0 || outAllow < 0 {
@@ -246,6 +245,26 @@ func TestOffloadRulesAndSets(t *testing.T) {
 	// Drop must be checked before allow within the same direction.
 	if !(inDrop < inAllow && inDropRev < inAllowRev && outDrop < outAllow) {
 		t.Fatalf("unexpected offload rule order: %v", rules)
+	}
+}
+
+func TestMakeInboundConcatKey(t *testing.T) {
+	key := makeInboundConcatKey(
+		net.IPv4(203, 0, 113, 5),
+		net.IPv4(172, 16, 233, 52),
+		22,
+	)
+	if len(key) != 12 {
+		t.Fatalf("key length = %d, want 12", len(key))
+	}
+	if key[0] != 203 || key[3] != 5 || key[4] != 172 || key[7] != 52 {
+		t.Fatalf("unexpected IP bytes: % x", key[:8])
+	}
+	if got := binary.BigEndian.Uint16(key[8:10]); got != 22 {
+		t.Fatalf("port = %d, want 22", got)
+	}
+	if key[10] != 0 || key[11] != 0 {
+		t.Fatalf("padding not zero: % x", key[10:])
 	}
 }
 

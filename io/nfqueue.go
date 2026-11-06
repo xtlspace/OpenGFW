@@ -55,8 +55,9 @@ const (
 )
 
 type offloadKey struct {
-	ip      [4]byte
-	port    uint16
+	ip      [4]byte // peer IP: client for inbound, remote for outbound
+	dstIP   [4]byte // container IP for inbound; zero for outbound
+	port    uint16  // service port for inbound, remote port for outbound
 	inbound bool
 }
 
@@ -89,6 +90,10 @@ func (k offloadKey) shard() uint32 {
 	// FNV-1a over the key, masking to the shard count.
 	h := uint32(2166136261)
 	for _, b := range k.ip {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	for _, b := range k.dstIP {
 		h ^= uint32(b)
 		h *= 16777619
 	}
@@ -139,7 +144,8 @@ func (c *offloadCounter) cleanup(maxAge time.Duration) {
 }
 
 type offloadEntry struct {
-	ip       net.IP
+	ip       net.IP // client for inbound, remote for outbound
+	dstIP    net.IP // container for inbound, nil for outbound
 	port     uint16
 	allow    bool
 	inbound  bool
@@ -165,6 +171,17 @@ func makeConcatKey(ip net.IP, port uint16) []byte {
 	key := make([]byte, 8)
 	copy(key[:4], ip.To4())
 	binary.BigEndian.PutUint16(key[4:6], port)
+	return key
+}
+
+// makeInboundConcatKey builds a key for inbound
+// ipv4_addr . ipv4_addr . inet_service sets.
+// Layout: [client IPv4 4B][container IPv4 4B][port 2B][padding 2B] = 12 bytes.
+func makeInboundConcatKey(clientIP, containerIP net.IP, port uint16) []byte {
+	key := make([]byte, 12)
+	copy(key[:4], clientIP.To4())
+	copy(key[4:8], containerIP.To4())
+	binary.BigEndian.PutUint16(key[8:10], port)
 	return key
 }
 
@@ -251,10 +268,14 @@ func generateNftRules(local, rst bool, protos nfProtocolConfig, queueCount int, 
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", nfqueueConnMarkDrop))
 	if offloadEnabled {
 		ttl := fmt.Sprintf("%ds", int(offloadTTL.Seconds()))
-		for _, name := range []string{
-			"offload_in_allow", "offload_in_drop",
-			"offload_out_allow", "offload_out_drop",
-		} {
+		for _, name := range []string{"offload_in_allow", "offload_in_drop"} {
+			table.Sets = append(table.Sets, nftSetSpec{
+				Name:    name,
+				Type:    "ipv4_addr . ipv4_addr . inet_service",
+				Timeout: ttl,
+			})
+		}
+		for _, name := range []string{"offload_out_allow", "offload_out_drop"} {
 			table.Sets = append(table.Sets, nftSetSpec{
 				Name:    name,
 				Type:    "ipv4_addr . inet_service",
@@ -311,18 +332,18 @@ func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
 		// Drop rules first: a key present in both sets must fail closed.
 		if rst {
 			rules = append(rules,
-				"ip saddr . tcp dport @offload_in_drop counter reject with tcp reset",
-				"ip daddr . tcp sport @offload_in_drop counter reject with tcp reset",
+				"ip saddr . ip daddr . tcp dport @offload_in_drop counter reject with tcp reset",
+				"ip daddr . ip saddr . tcp sport @offload_in_drop counter reject with tcp reset",
 			)
 		} else {
 			rules = append(rules,
-				"ip saddr . tcp dport @offload_in_drop counter drop",
-				"ip daddr . tcp sport @offload_in_drop counter drop",
+				"ip saddr . ip daddr . tcp dport @offload_in_drop counter drop",
+				"ip daddr . ip saddr . tcp sport @offload_in_drop counter drop",
 			)
 		}
 		rules = append(rules,
-			"ip saddr . tcp dport @offload_in_allow accept",
-			"ip daddr . tcp sport @offload_in_allow accept",
+			"ip saddr . ip daddr . tcp dport @offload_in_allow accept",
+			"ip daddr . ip saddr . tcp sport @offload_in_allow accept",
 		)
 		if rst {
 			rules = append(rules,
@@ -342,10 +363,10 @@ func offloadLookupRules(protos nfProtocolConfig, rst bool) []string {
 	}
 	if protos.UDP {
 		rules = append(rules,
-			"ip saddr . udp dport @offload_in_drop counter drop",
-			"ip daddr . udp sport @offload_in_drop counter drop",
-			"ip saddr . udp dport @offload_in_allow accept",
-			"ip daddr . udp sport @offload_in_allow accept",
+			"ip saddr . ip daddr . udp dport @offload_in_drop counter drop",
+			"ip daddr . ip saddr . udp sport @offload_in_drop counter drop",
+			"ip saddr . ip daddr . udp dport @offload_in_allow accept",
+			"ip daddr . ip saddr . udp sport @offload_in_allow accept",
 			"ip daddr . udp dport @offload_out_drop counter drop",
 			"ip saddr . udp sport @offload_out_drop counter drop",
 			"ip daddr . udp dport @offload_out_allow accept",
@@ -1123,7 +1144,7 @@ func offloadKeyFor(srcIP, dstIP [4]byte, srcPort, dstPort uint16, reply bool, ci
 		srcPort, dstPort = dstPort, srcPort
 	}
 	if cidr.Contains(net.IP(dstIP[:])) {
-		return offloadKey{ip: srcIP, port: dstPort, inbound: true}, true
+		return offloadKey{ip: srcIP, dstIP: dstIP, port: dstPort, inbound: true}, true
 	}
 	if cidr.Contains(net.IP(srcIP[:])) {
 		return offloadKey{ip: dstIP, port: dstPort, inbound: false}, true
@@ -1160,14 +1181,18 @@ func (n *nfqueuePacketIO) checkOffload(p *nfqueuePacket, allow bool, ruleName st
 	}
 
 	if n.offloadCounter.increment(key, allow, n.offloadThreshold) {
-		select {
-		case n.offloadCh <- offloadEntry{
+		entry := offloadEntry{
 			ip:       net.IP(key.ip[:]),
 			port:     key.port,
 			allow:    allow,
 			inbound:  key.inbound,
 			ruleName: ruleName,
-		}:
+		}
+		if key.inbound {
+			entry.dstIP = net.IP(key.dstIP[:])
+		}
+		select {
+		case n.offloadCh <- entry:
 		default:
 		}
 	}
@@ -1195,8 +1220,12 @@ func (n *nfqueuePacketIO) offloadWorker() {
 		default:
 			list = &outDrop
 		}
+		key := makeConcatKey(e.ip, e.port)
+		if e.inbound {
+			key = makeInboundConcatKey(e.ip, e.dstIP, e.port)
+		}
 		elem := nftables.SetElement{
-			Key:     makeConcatKey(e.ip, e.port),
+			Key:     key,
 			Timeout: n.offloadTTL,
 		}
 		if e.ruleName != "" {
